@@ -1,0 +1,12 @@
+# dependencies
+node_modules/
+# runtime data (mounted volume may still mirror here sometimes)
+data/
+backups/
+
+# secrets / env
+.env
+
+# backups
+*.bak
+*.bak.*
