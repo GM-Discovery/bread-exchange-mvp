@@ -43,6 +43,37 @@ function saveDB(db) {
 function nowIso() {
   return new Date().toISOString();
 }
+function parseIsoToMs(s) {
+  const t = Date.parse(String(s || ""));
+  return Number.isFinite(t) ? t : null;
+}
+
+function maybeCloseExpiredPoll(db, poll) {
+  if (!poll.expires_at) return false;
+  if (poll.status !== "open") return false;
+  if (new Date(poll.expires_at) > new Date()) return false;
+
+  poll.status = "closed";
+  poll.closed_at = nowIso();
+  db.events.push({ kind: "poll_closed", poll_id: poll.id, at: poll.closed_at });
+  saveDB(db);
+  return true;
+}
+
+function maybeCloseExpiredPoll(db, poll) {
+  if (!poll || poll.status !== "open") return false;
+  if (!poll.expires_at) return false;
+
+  const exp = parseIsoToMs(poll.expires_at);
+  if (exp === null || Date.now() < exp) return false;
+
+  poll.status = "closed";
+  poll.closed_at = nowIso();
+  db.events.push({ kind: "poll_closed", poll_id: poll.id, at: nowIso(), reason: "expired" });
+  saveDB(db);
+  return true;
+}
+
 
 // ---- SSE subscribers per poll ----
 const subscribers = new Map(); // pollId -> Set(res)
@@ -70,11 +101,14 @@ app.get("/api/health", (req, res) => {
 
 app.get("/api/polls", (req, res) => {
   const db = loadDB();
-  const polls = db.polls.map(p => ({
+  const polls = db.polls.map(p => {
+  maybeCloseExpiredPoll(db, p);
+  return {
     ...p,
     results: computeResults(db, p.id),
-  }));
-  res.json({ polls });
+  };
+});
+res.json({ polls });
 });
 
 app.post("/api/polls", (req, res) => {
@@ -96,7 +130,9 @@ app.post("/api/polls", (req, res) => {
       label: (o && o.label) ? String(o.label).slice(0, 200) : `Option ${idx + 1}`,
     })),
     status: "open",
+    closed_at: null,
     created_at: nowIso(),
+    expires_at: req.body?.expires_at ? String(req.body.expires_at) : null,
     // Future: domain tags, weighting policy, protected-voices config
     meta: req.body?.meta || {},
   };
@@ -117,6 +153,7 @@ app.post("/api/polls/:id/vote", (req, res) => {
   const db = loadDB();
   const poll = db.polls.find(p => p.id === pollId);
   if (!poll) return res.status(404).json({ error: "poll not found" });
+  maybeCloseExpiredPoll(db, poll);
   if (poll.status !== "open") return res.status(400).json({ error: "poll is closed" });
 
   const token = voter_token ? String(voter_token) : nanoid(16);
