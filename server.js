@@ -21,6 +21,7 @@ const path = require("path");
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
+const REQUIRE_KEY_SESSION = process.env.REQUIRE_KEY_SESSION === "1";
 
 // ---- Persistence ----
 const DATA_DIR = path.join(__dirname, "data");
@@ -29,7 +30,7 @@ if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 function loadDB() {
   if (!fs.existsSync(DB_PATH)) {
-    const empty = { polls: [], votes: [], events: [] };
+    const empty = { polls: [], votes: [], events: [], keys: [], challenges: [] };
     fs.writeFileSync(DB_PATH, JSON.stringify(empty, null, 2));
     return empty;
   }
