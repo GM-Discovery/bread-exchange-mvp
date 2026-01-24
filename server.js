@@ -33,10 +33,26 @@ if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 function loadDB() {
   if (!fs.existsSync(DB_PATH)) {
-    const empty = { polls: [], votes: [], events: [], keys: [], challenges: [] };
+    // Minimal "empty DB" shape.
+    // Keep existing arrays even if unused (keys/challenges) to avoid breaking future plans.
+    const empty = {
+      polls: [],
+      votes: [],
+      events: [],
+
+      // Future-facing placeholders (currently unused, but harmless to keep):
+      keys: [],
+      challenges: [],
+
+      // NEW: MVP device-persona + stamp system
+      personas: [], // Each persona = a device (for now)
+      stamps: [],   // Stores ONLY hashes of stamp tokens + mapping to persona
+    };
+
     fs.writeFileSync(DB_PATH, JSON.stringify(empty, null, 2));
     return empty;
   }
+
   return JSON.parse(fs.readFileSync(DB_PATH, "utf-8"));
 }
 
