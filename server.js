@@ -18,10 +18,13 @@ const { nanoid } = require("nanoid");
 const fs = require("fs");
 const path = require("path");
 
+const { applyLifecycle, canVote, isVisibleInList, nowIso } = require("./lib/lifecycle");
+
 const app = express();
-app.use(cors());
+// app.use(cors());
 app.use(express.json({ limit: "1mb" }));
-const REQUIRE_KEY_SESSION = process.env.REQUIRE_KEY_SESSION === "1";
+
+const REQUIRE_KEY_SESSION = process.env.REQUIRE_KEY_SESSION === "1"; // reserved for later
 
 // ---- Persistence ----
 const DATA_DIR = path.join(__dirname, "data");
@@ -41,40 +44,11 @@ function saveDB(db) {
   fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2));
 }
 
-function nowIso() {
-  return new Date().toISOString();
-}
+// (Optional helper; ok to keep even if unused right now)
 function parseIsoToMs(s) {
   const t = Date.parse(String(s || ""));
   return Number.isFinite(t) ? t : null;
 }
-
-function maybeCloseExpiredPoll(db, poll) {
-  if (!poll.expires_at) return false;
-  if (poll.status !== "open") return false;
-  if (new Date(poll.expires_at) > new Date()) return false;
-
-  poll.status = "closed";
-  poll.closed_at = nowIso();
-  db.events.push({ kind: "poll_closed", poll_id: poll.id, at: poll.closed_at });
-  saveDB(db);
-  return true;
-}
-
-function maybeCloseExpiredPoll(db, poll) {
-  if (!poll || poll.status !== "open") return false;
-  if (!poll.expires_at) return false;
-
-  const exp = parseIsoToMs(poll.expires_at);
-  if (exp === null || Date.now() < exp) return false;
-
-  poll.status = "closed";
-  poll.closed_at = nowIso();
-  db.events.push({ kind: "poll_closed", poll_id: poll.id, at: nowIso(), reason: "expired" });
-  saveDB(db);
-  return true;
-}
-
 
 // ---- SSE subscribers per poll ----
 const subscribers = new Map(); // pollId -> Set(res)
@@ -88,7 +62,9 @@ function broadcast(pollId, event, data) {
   const set = subscribers.get(pollId);
   if (!set) return;
   for (const res of set) {
-    try { sseSend(res, event, data); } catch (_) {}
+    try {
+      sseSend(res, event, data);
+    } catch (_) {}
   }
 }
 
@@ -102,14 +78,23 @@ app.get("/api/health", (req, res) => {
 
 app.get("/api/polls", (req, res) => {
   const db = loadDB();
-  const polls = db.polls.map(p => {
-  maybeCloseExpiredPoll(db, p);
-  return {
-    ...p,
-    results: computeResults(db, p.id),
-  };
-});
-res.json({ polls });
+
+  // Apply lifecycle transitions before listing
+  let changed = false;
+  for (const p of db.polls) {
+    const r = applyLifecycle(p, nowIso());
+    if (r.changed) changed = true;
+  }
+  if (changed) saveDB(db);
+
+  const polls = db.polls
+    .filter(p => isVisibleInList(p, nowIso()))
+    .map(p => ({
+      ...p,
+      results: computeResults(db, p.id),
+    }));
+
+  res.json({ polls });
 });
 
 app.post("/api/polls", (req, res) => {
@@ -127,14 +112,13 @@ app.post("/api/polls", (req, res) => {
     description: description ? String(description).slice(0, 5000) : "",
     type: type ? String(type) : "single",
     options: options.map((o, idx) => ({
-      id: (o && o.id) ? String(o.id) : String(idx + 1),
-      label: (o && o.label) ? String(o.label).slice(0, 200) : `Option ${idx + 1}`,
+      id: o && o.id ? String(o.id) : String(idx + 1),
+      label: o && o.label ? String(o.label).slice(0, 200) : `Option ${idx + 1}`,
     })),
     status: "open",
     closed_at: null,
     created_at: nowIso(),
     expires_at: req.body?.expires_at ? String(req.body.expires_at) : null,
-    // Future: domain tags, weighting policy, protected-voices config
     meta: req.body?.meta || {},
   };
 
@@ -154,18 +138,19 @@ app.post("/api/polls/:id/vote", (req, res) => {
   const db = loadDB();
   const poll = db.polls.find(p => p.id === pollId);
   if (!poll) return res.status(404).json({ error: "poll not found" });
-  maybeCloseExpiredPoll(db, poll);
-  if (poll.status !== "open") return res.status(400).json({ error: "poll is closed" });
+
+  // Apply lifecycle on access
+  const life = applyLifecycle(poll, nowIso());
+  if (life.changed) saveDB(db);
+
+  if (!canVote(poll)) return res.status(400).json({ error: "poll is closed" });
 
   const token = voter_token ? String(voter_token) : nanoid(16);
 
-  const prev = db.votes.find(
-    v => v.poll_id === pollId && v.voter_token === token
-  );
+  const prev = db.votes.find(v => v.poll_id === pollId && v.voter_token === token);
 
-  db.votes = db.votes.filter(
-    v => !(v.poll_id === pollId && v.voter_token === token)
-  );
+  // One vote per token per poll: replace existing vote from same token
+  db.votes = db.votes.filter(v => !(v.poll_id === pollId && v.voter_token === token));
 
   db.votes.push({
     id: nanoid(12),
@@ -208,7 +193,9 @@ app.get("/api/polls/:id/stream", (req, res) => {
 
   // Keepalive
   const interval = setInterval(() => {
-    try { res.write(":keepalive\n\n"); } catch (_) {}
+    try {
+      res.write(":keepalive\n\n");
+    } catch (_) {}
   }, 15000);
 
   req.on("close", () => {
