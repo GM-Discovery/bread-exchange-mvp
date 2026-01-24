@@ -19,6 +19,68 @@ const fs = require("fs");
 const path = require("path");
 
 const { applyLifecycle, canVote, isVisibleInList, nowIso } = require("./lib/lifecycle");
+const STAMP_POOL_TARGET = 3;        // How many active stamps a persona should hold
+const STAMP_POOL_MAX = 7;           // Hard cap for active stamps per persona
+const STAMP_ROTATE_EVERY_USES = 1000; // Not implemented yet (skeleton only)
+
+// Header name is locked by your decision:
+const STAMP_HEADER = "X-Stamp";
+
+const crypto = require("crypto");
+
+// Hash a stamp token so we never store plaintext tokens in db.json.
+// If db.json leaks, attackers still shouldn't get working stamps.
+function hashStampToken(token) {
+  return crypto.createHash("sha256").update(String(token)).digest("hex");
+}
+
+// Generate a new opaque stamp token to hand to the client.
+// We *do not* store this raw token in the DB, only the hash.
+function generateStampToken() {
+  // 32 bytes -> 64 hex chars. Prefixed for readability.
+  return "s_" + crypto.randomBytes(32).toString("hex");
+}
+
+// Find a stamp record by the *presented* raw token.
+function findStampByToken(db, token) {
+  const tokenHash = hashStampToken(token);
+  return db.stamps.find(s => s.token_hash === tokenHash && s.status === "ACTIVE") || null;
+}
+
+// Ensure a persona exists. For MVP, a persona is simply "an entity that holds stamps".
+// No identity, no device IDs, no recovery.
+function createPersona(db) {
+  const persona = {
+    id: "per_" + nanoid(12),
+    created_at: nowIso(),
+    meta: {},
+  };
+  db.personas.push(persona);
+  return persona;
+}
+
+// Issue exactly one new stamp and persist it.
+// Returns the raw token (client must store it), and the record is stored hashed.
+function issueOneStamp(db, personaId) {
+  const token = generateStampToken();
+  const rec = {
+    id: "st_" + nanoid(12),
+    persona_id: personaId,
+    token_hash: hashStampToken(token),
+    status: "ACTIVE",
+    issued_at: nowIso(),
+    use_count: 0,
+    last_used_at: null,
+    // Future fields: rotated_at, replaced_by, revoked_at, etc.
+  };
+  db.stamps.push(rec);
+  return token;
+}
+
+// Count ACTIVE stamps for a persona
+function countActiveStamps(db, personaId) {
+  return db.stamps.filter(s => s.persona_id === personaId && s.status === "ACTIVE").length;
+}
 
 const app = express();
 // app.use(cors());
@@ -44,8 +106,8 @@ function loadDB() {
       keys: [],
       challenges: [],
 
-      // NEW: MVP device-persona + stamp system
-      personas: [], // Each persona = a device (for now)
+      // NEW: MVP persona + stamp system
+      personas: [], // Each persona = holder of stamps (device for now)
       stamps: [],   // Stores ONLY hashes of stamp tokens + mapping to persona
     };
 
@@ -53,8 +115,16 @@ function loadDB() {
     return empty;
   }
 
-  return JSON.parse(fs.readFileSync(DB_PATH, "utf-8"));
+  // File exists → read it
+  const db = JSON.parse(fs.readFileSync(DB_PATH, "utf-8"));
+
+  // Backfill new fields for older DB files
+  if (!Array.isArray(db.personas)) db.personas = [];
+  if (!Array.isArray(db.stamps)) db.stamps = [];
+
+  return db;
 }
+
 
 function saveDB(db) {
   fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2));
@@ -90,6 +160,81 @@ app.use(express.static(path.join(__dirname, "public")));
 // ---- API ----
 app.get("/api/health", (req, res) => {
   res.json({ ok: true, time: nowIso() });
+});
+
+// ---- STAMP ISSUANCE ----
+// Uses existing Caddy Basic Auth gate (treat as a "write").
+// Behavior:
+// - If client provides a valid X-Stamp -> resolve persona, top up if below target
+// - If no/invalid stamp -> create new persona, issue target stamps
+app.post("/api/stamp", (req, res) => {
+  const presented = req.get(STAMP_HEADER); // "X-Stamp"
+  const db = loadDB();
+
+  // Try to resolve existing persona from presented stamp (if any)
+  let personaId = null;
+  if (presented) {
+    const stampRec = findStampByToken(db, presented);
+    if (stampRec) {
+      personaId = stampRec.persona_id;
+      // (Optional) track last-used time (doesn't change behavior yet)
+      stampRec.last_used_at = nowIso();
+    }
+  }
+
+  // If no valid stamp, create a brand new persona (MVP "no recovery" model)
+  if (!personaId) {
+    const persona = createPersona(db);
+    personaId = persona.id;
+
+    // Issue initial pool
+    const issued = [];
+    const toIssue = Math.min(STAMP_POOL_TARGET, STAMP_POOL_MAX);
+    for (let i = 0; i < toIssue; i++) {
+      issued.push(issueOneStamp(db, personaId));
+    }
+
+    db.events.push({ kind: "stamp_issued", persona_id: personaId, at: nowIso(), count: issued.length });
+    saveDB(db);
+
+    return res.json({
+      ok: true,
+      persona_id: personaId, // INTERNAL-ish; fine for now, remove later if you want less leakage
+      issued,
+      active_count: countActiveStamps(db, personaId),
+      target: STAMP_POOL_TARGET,
+      max: STAMP_POOL_MAX,
+    });
+  }
+
+  // Persona exists: top-up logic (rotation later)
+  const active = countActiveStamps(db, personaId);
+  const issued = [];
+
+  // Top up to target (but never exceed max)
+  const desired = Math.min(STAMP_POOL_TARGET, STAMP_POOL_MAX);
+  const room = Math.max(0, STAMP_POOL_MAX - active);
+  const need = Math.max(0, desired - active);
+  const toIssue = Math.min(room, need);
+
+  for (let i = 0; i < toIssue; i++) {
+    issued.push(issueOneStamp(db, personaId));
+  }
+
+  if (issued.length > 0) {
+    db.events.push({ kind: "stamp_topped_up", persona_id: personaId, at: nowIso(), count: issued.length });
+  }
+
+  saveDB(db);
+
+  return res.json({
+    ok: true,
+    persona_id: personaId, // INTERNAL-ish; fine for now
+    issued,                // empty array means "you already have enough"
+    active_count: countActiveStamps(db, personaId),
+    target: STAMP_POOL_TARGET,
+    max: STAMP_POOL_MAX,
+  });
 });
 
 app.get("/api/polls", (req, res) => {
@@ -152,6 +297,14 @@ app.post("/api/polls/:id/vote", (req, res) => {
   if (!option_id) return res.status(400).json({ error: "option_id is required" });
 
   const db = loadDB();
+
+  // ---- STAMP REQUIRED (MVP) ----
+  const presented = req.get(STAMP_HEADER); // "X-Stamp"
+  if (!presented) return res.status(401).json({ error: "missing X-Stamp" });
+
+  const stampRec = findStampByToken(db, presented);
+  if (!stampRec) return res.status(403).json({ error: "invalid X-Stamp" });
+
   const poll = db.polls.find(p => p.id === pollId);
   if (!poll) return res.status(404).json({ error: "poll not found" });
 
