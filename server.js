@@ -22,6 +22,7 @@ const { applyLifecycle, canVote, isVisibleInList, nowIso } = require("./lib/life
 const STAMP_POOL_TARGET = 3;        // How many active stamps a persona should hold
 const STAMP_POOL_MAX = 7;           // Hard cap for active stamps per persona
 const STAMP_ROTATE_EVERY_USES = 1000; // Not implemented yet (skeleton only)
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
 
 // Header name is locked by your decision:
 const STAMP_HEADER = "X-Stamp";
@@ -87,47 +88,120 @@ const app = express();
 app.use(express.json({ limit: "1mb" }));
 
 const REQUIRE_KEY_SESSION = process.env.REQUIRE_KEY_SESSION === "1"; // reserved for later
+// ---- Persistence (split DB) ----
+// Goal: keep identity material separate from poll/vote material.
+// We keep the old db.json as a one-time migration source only.
 
-// ---- Persistence ----
-const DATA_DIR = path.join(__dirname, "data");
-const DB_PATH = path.join(DATA_DIR, "db.json");
+const LEGACY_DB_PATH = path.join(DATA_DIR, "db.json");
+
+// NEW: split stores
+const EXCHANGE_DB_PATH = path.join(DATA_DIR, "exchange.private.json"); // polls/votes/events
+const IDENTITY_DB_PATH = path.join(DATA_DIR, "identity.private.json"); // personas/stamps (+future)
+
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
-function loadDB() {
-  if (!fs.existsSync(DB_PATH)) {
-    // Minimal "empty DB" shape.
-    // Keep existing arrays even if unused (keys/challenges) to avoid breaking future plans.
-    const empty = {
-      polls: [],
-      votes: [],
-      events: [],
-
-      // Future-facing placeholders (currently unused, but harmless to keep):
-      keys: [],
-      challenges: [],
-
-      // NEW: MVP persona + stamp system
-      personas: [], // Each persona = holder of stamps (device for now)
-      stamps: [],   // Stores ONLY hashes of stamp tokens + mapping to persona
-    };
-
-    fs.writeFileSync(DB_PATH, JSON.stringify(empty, null, 2));
-    return empty;
+function readJsonOrInit(filePath, emptyObj) {
+  if (!fs.existsSync(filePath)) {
+    fs.writeFileSync(filePath, JSON.stringify(emptyObj, null, 2));
+    return emptyObj;
   }
-
-  // File exists → read it
-  const db = JSON.parse(fs.readFileSync(DB_PATH, "utf-8"));
-
-  // Backfill new fields for older DB files
-  if (!Array.isArray(db.personas)) db.personas = [];
-  if (!Array.isArray(db.stamps)) db.stamps = [];
-
-  return db;
+  return JSON.parse(fs.readFileSync(filePath, "utf-8"));
 }
 
+function writeJson(filePath, obj) {
+  fs.writeFileSync(filePath, JSON.stringify(obj, null, 2));
+}
 
+// One-time migration:
+// If legacy db.json exists but split files don't, split it.
+// This keeps behavior stable after deploy, without manual steps.
+function migrateLegacyDbIfNeeded() {
+  const legacyExists = fs.existsSync(LEGACY_DB_PATH);
+  const exchangeExists = fs.existsSync(EXCHANGE_DB_PATH);
+  const identityExists = fs.existsSync(IDENTITY_DB_PATH);
+
+  if (!legacyExists) return;
+  if (exchangeExists && identityExists) return;
+
+  const legacy = JSON.parse(fs.readFileSync(LEGACY_DB_PATH, "utf-8"));
+
+  const exchangeEmpty = { polls: [], votes: [], events: [] };
+  const identityEmpty = { personas: [], stamps: [], keys: [], challenges: [] };
+
+  const exchange = {
+    polls: Array.isArray(legacy.polls) ? legacy.polls : [],
+    votes: Array.isArray(legacy.votes) ? legacy.votes : [],
+    events: Array.isArray(legacy.events) ? legacy.events : [],
+  };
+
+  const identity = {
+    // If these exist in your current db.json, carry them forward.
+    personas: Array.isArray(legacy.personas) ? legacy.personas : [],
+    stamps: Array.isArray(legacy.stamps) ? legacy.stamps : [],
+    // Keep placeholders you already had (harmless):
+    keys: Array.isArray(legacy.keys) ? legacy.keys : [],
+    challenges: Array.isArray(legacy.challenges) ? legacy.challenges : [],
+  };
+
+  // If missing, initialize new files
+  if (!exchangeExists) writeJson(EXCHANGE_DB_PATH, exchangeEmpty);
+  if (!identityExists) writeJson(IDENTITY_DB_PATH, identityEmpty);
+
+  // Overwrite with migrated content
+  writeJson(EXCHANGE_DB_PATH, exchange);
+  writeJson(IDENTITY_DB_PATH, identity);
+
+  // Keep legacy as a backup (do NOT delete automatically)
+  // Optional: rename legacy file to make it obvious it's legacy
+  // fs.renameSync(LEGACY_DB_PATH, `${LEGACY_DB_PATH}.migrated`);
+}
+
+// loadDB returns a merged view so the rest of server.js does not need refactors.
+function loadDB() {
+  migrateLegacyDbIfNeeded();
+
+  const exchange = readJsonOrInit(EXCHANGE_DB_PATH, { polls: [], votes: [], events: [] });
+  const identity = readJsonOrInit(IDENTITY_DB_PATH, { personas: [], stamps: [], keys: [], challenges: [] });
+
+  // Backfill new arrays if someone hand-edited files
+  if (!Array.isArray(exchange.polls)) exchange.polls = [];
+  if (!Array.isArray(exchange.votes)) exchange.votes = [];
+  if (!Array.isArray(exchange.events)) exchange.events = [];
+
+  if (!Array.isArray(identity.personas)) identity.personas = [];
+  if (!Array.isArray(identity.stamps)) identity.stamps = [];
+  if (!Array.isArray(identity.keys)) identity.keys = [];
+  if (!Array.isArray(identity.challenges)) identity.challenges = [];
+
+  // Merge for existing code compatibility
+  return {
+    polls: exchange.polls,
+    votes: exchange.votes,
+    events: exchange.events,
+
+    personas: identity.personas,
+    stamps: identity.stamps,
+    keys: identity.keys,
+    challenges: identity.challenges,
+  };
+}
+
+// saveDB splits the merged view back into the correct files.
 function saveDB(db) {
-  fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2));
+  // Exchange runtime state
+  writeJson(EXCHANGE_DB_PATH, {
+    polls: Array.isArray(db.polls) ? db.polls : [],
+    votes: Array.isArray(db.votes) ? db.votes : [],
+    events: Array.isArray(db.events) ? db.events : [],
+  });
+
+  // Identity / authority state
+  writeJson(IDENTITY_DB_PATH, {
+    personas: Array.isArray(db.personas) ? db.personas : [],
+    stamps: Array.isArray(db.stamps) ? db.stamps : [],
+    keys: Array.isArray(db.keys) ? db.keys : [],
+    challenges: Array.isArray(db.challenges) ? db.challenges : [],
+  });
 }
 
 // (Optional helper; ok to keep even if unused right now)
