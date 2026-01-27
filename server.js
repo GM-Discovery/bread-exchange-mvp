@@ -62,8 +62,9 @@ function createPersona(db) {
 
 // Issue exactly one new stamp and persist it.
 // Returns the raw token (client must store it), and the record is stored hashed.
-function issueOneStamp(db, personaId) {
+function issueOneStamp(db, personaId, options = {}) {
   const token = generateStampToken();
+
   const rec = {
     id: "st_" + nanoid(12),
     persona_id: personaId,
@@ -72,8 +73,11 @@ function issueOneStamp(db, personaId) {
     issued_at: nowIso(),
     use_count: 0,
     last_used_at: null,
+    weight: typeof options.weight === "number" ? options.weight : 1.0,
+    tags: Array.isArray(options.tags) ? options.tags : []
     // Future fields: rotated_at, replaced_by, revoked_at, etc.
   };
+
   db.stamps.push(rec);
   return token;
 }
@@ -265,7 +269,7 @@ app.post("/api/stamp", (req, res) => {
     const issued = [];
     const toIssue = Math.min(STAMP_POOL_TARGET, STAMP_POOL_MAX);
     for (let i = 0; i < toIssue; i++) {
-      issued.push(issueOneStamp(db, personaId));
+      issued.push(issueOneStamp(db, personaId, req.body));
     }
 
     db.events.push({ kind: "stamp_issued", persona_id: personaId, at: nowIso(), count: issued.length });
@@ -292,7 +296,7 @@ app.post("/api/stamp", (req, res) => {
   const toIssue = Math.min(room, need);
 
   for (let i = 0; i < toIssue; i++) {
-    issued.push(issueOneStamp(db, personaId));
+    issued.push(issueOneStamp(db, personaId, req.body));
   }
 
   if (issued.length > 0) {
