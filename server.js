@@ -35,6 +35,45 @@ function hashStampToken(token) {
   return crypto.createHash("sha256").update(String(token)).digest("hex");
 }
 
+/**
+ * Ballot UID helpers
+ *
+ * Goal: derive a stable "ballot identity" per (stamp, poll) without storing stamp IDs in votes.
+ *
+ * ballot_uid = SHA256(stamp_token_hash + ":" + pollId + ":" + server_salt)
+ *
+ * - stamp_token_hash is already stored in identity.private.json as stampRec.token_hash
+ * - server_salt is stored once in db.keys so it survives restarts
+ * - pollId scopes the uid so the same stamp can't be linked across different polls via uid
+ */
+
+function getOrCreateBallotSalt(db) {
+  const kind = "ballot_uid_salt";
+
+  // Look for an existing salt in db.keys (identity DB section)
+  let rec = Array.isArray(db.keys) ? db.keys.find(k => k && k.kind === kind) : null;
+  if (rec && typeof rec.value === "string" && rec.value.length >= 16) return rec.value;
+
+  // Create a new salt and persist it
+  const salt = crypto.randomBytes(32).toString("hex"); // 64 hex chars
+  if (!Array.isArray(db.keys)) db.keys = [];
+
+  db.keys.push({
+    id: "key_" + nanoid(10),
+    kind,
+    value: salt,
+    created_at: nowIso(),
+  });
+
+  return salt;
+}
+
+function makeBallotUid(db, pollId, stampTokenHash) {
+  const salt = getOrCreateBallotSalt(db);
+  const input = `${String(stampTokenHash)}:${String(pollId)}:${salt}`;
+  return crypto.createHash("sha256").update(input).digest("hex");
+}
+
 // Generate a new opaque stamp token to hand to the client.
 // We *do not* store this raw token in the DB, only the hash.
 function generateStampToken() {
@@ -74,7 +113,7 @@ function issueOneStamp(db, personaId, options = {}) {
     use_count: 0,
     last_used_at: null,
     weight: typeof options.weight === "number" ? options.weight : 1.0,
-    tags: Array.isArray(options.tags) ? options.tags : []
+    tags: Array.isArray(options.tags) ? options.tags : [],
     // Future fields: rotated_at, replaced_by, revoked_at, etc.
   };
 
@@ -371,7 +410,7 @@ app.post("/api/polls", (req, res) => {
 
 app.post("/api/polls/:id/vote", (req, res) => {
   const pollId = req.params.id;
-  const { option_id, voter_token } = req.body || {};
+  const { option_id } = req.body || {};
   if (!option_id) return res.status(400).json({ error: "option_id is required" });
 
   const db = loadDB();
@@ -380,9 +419,31 @@ app.post("/api/polls/:id/vote", (req, res) => {
   const presented = req.get(STAMP_HEADER); // "X-Stamp"
   if (!presented) return res.status(401).json({ error: "missing X-Stamp" });
 
+  // Stamp must exist
   const stampRec = findStampByToken(db, presented);
   if (!stampRec) return res.status(403).json({ error: "invalid X-Stamp" });
 
+  // ---- WEIGHT VALIDATION (authoritative) ----
+  // Missing / invalid / <= 0 weight => assume forgery; expire stamp; reject vote.
+  const rawWeight = stampRec.weight;
+  const weight = Number(rawWeight);
+
+  if (!Number.isFinite(weight) || weight <= 0) {
+    stampRec.status = "EXPIRED";
+    stampRec.last_used_at = nowIso();
+
+    db.events.push({
+      kind: "stamp_expired_invalid_weight",
+      stamp_id: stampRec.id,
+      at: nowIso(),
+      note: `weight=${String(rawWeight)}`,
+    });
+
+    saveDB(db);
+    return res.status(403).json({ error: "try voting again at a different time" });
+  }
+
+  // Poll must exist
   const poll = db.polls.find(p => p.id === pollId);
   if (!poll) return res.status(404).json({ error: "poll not found" });
 
@@ -392,18 +453,26 @@ app.post("/api/polls/:id/vote", (req, res) => {
 
   if (!canVote(poll)) return res.status(400).json({ error: "poll is closed" });
 
-  const token = voter_token ? String(voter_token) : nanoid(16);
+  // Server-derived ballot identity (one per stamp per poll)
+  // NOTE: makeBallotUid() must already exist (we added it in Step 2).
+  const ballotUid = makeBallotUid(db, pollId, stampRec.token_hash);
 
-  const prev = db.votes.find(v => v.poll_id === pollId && v.voter_token === token);
-
-  // One vote per token per poll: replace existing vote from same token
-  db.votes = db.votes.filter(v => !(v.poll_id === pollId && v.voter_token === token));
+  // One vote per ballotUid per poll: replace existing vote from same ballotUid
+  const prev = db.votes.find(v => v.poll_id === pollId && v.voter_token === ballotUid);
+  db.votes = db.votes.filter(v => !(v.poll_id === pollId && v.voter_token === ballotUid));
 
   db.votes.push({
     id: nanoid(12),
     poll_id: pollId,
     option_id: String(option_id),
-    voter_token: token,
+
+    // Stored as voter_token for backward compatibility with existing API shape.
+    // Semantically this is the ballot_uid.
+    voter_token: ballotUid,
+
+    // Authoritative stamp weight used for tally.
+    weight,
+
     created_at: prev ? prev.created_at : nowIso(),
     updated_at: prev ? nowIso() : null,
     meta: req.body?.meta || {},
@@ -415,41 +484,7 @@ app.post("/api/polls/:id/vote", (req, res) => {
   const results = computeResults(db, pollId);
   broadcast(pollId, "results", { poll_id: pollId, results });
 
-  res.json({ ok: true, voter_token: token, results });
-});
-
-app.get("/api/polls/:id/stream", (req, res) => {
-  const pollId = req.params.id;
-  const db = loadDB();
-  const poll = db.polls.find(p => p.id === pollId);
-  if (!poll) return res.status(404).end();
-
-  // SSE headers
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("Connection", "keep-alive");
-  res.flushHeaders?.();
-
-  // Register subscriber
-  if (!subscribers.has(pollId)) subscribers.set(pollId, new Set());
-  subscribers.get(pollId).add(res);
-
-  // Send initial snapshot
-  const results = computeResults(db, pollId);
-  sseSend(res, "poll", { kind: "snapshot", poll, results });
-
-  // Keepalive
-  const interval = setInterval(() => {
-    try {
-      res.write(":keepalive\n\n");
-    } catch (_) {}
-  }, 15000);
-
-  req.on("close", () => {
-    clearInterval(interval);
-    const set = subscribers.get(pollId);
-    if (set) set.delete(res);
-  });
+  res.json({ ok: true, voter_token: ballotUid, results });
 });
 
 function computeResults(db, pollId) {
@@ -460,12 +495,44 @@ function computeResults(db, pollId) {
   for (const opt of poll.options) totals[opt.id] = 0;
 
   const votes = db.votes.filter(v => v.poll_id === pollId);
+
+  // Stats for audit clarity (computational weights given)
+  let wMin = null;
+  let wMax = null;
+  let wSum = 0;
+  let wCount = 0;
+
   for (const v of votes) {
     if (totals[v.option_id] === undefined) continue;
-    totals[v.option_id] += 1; // Future: add computed_weight
+
+    // Defensive: a bad stored weight must never turn totals into NaN.
+    // (Vote endpoint should already enforce weight > 0.)
+    const w = Number(v.weight);
+    if (!Number.isFinite(w) || w <= 0) continue;
+
+    totals[v.option_id] += w;
+
+    wMin = (wMin === null) ? w : Math.min(wMin, w);
+    wMax = (wMax === null) ? w : Math.max(wMax, w);
+    wSum += w;
+    wCount += 1;
   }
-  return { totals, total_votes: votes.length };
+
+  return {
+    totals,
+
+    // Backward compatibility
+    total_votes: votes.length,
+
+    // New explicit fields
+    people_voted: votes.length,        // one stored vote per ballotUid (unique stamp per poll)
+    represented_people: wSum,          // sum of weights
+    weights_used: { min: wMin, max: wMax, sum: wSum, count: wCount },
+
+    validated: true,
+  };
 }
+
 
 const PORT = process.env.PORT || 8787;
 app.listen(PORT, "0.0.0.0", () => {
