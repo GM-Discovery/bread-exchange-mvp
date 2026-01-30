@@ -356,20 +356,36 @@ app.post("/api/stamp", (req, res) => {
 
 app.get("/api/polls", (req, res) => {
   const db = loadDB();
+  const t = nowIso();
+  let changedAny = false;
 
-  // Apply lifecycle transitions before listing
-  let changed = false;
+  // Apply lifecycle + snapshot persistence
   for (const p of db.polls) {
-    const r = applyLifecycle(p, nowIso());
-    if (r.changed) changed = true;
-  }
-  if (changed) saveDB(db);
+    const life = applyLifecycle(p, t);
 
+    const usesFinalSnapshot =
+      p.poll_class === "LEGITIMACY" || p.poll_class === "GOVERNANCE";
+
+    const isLocked =
+      p.status === "published" || !!p.finalized_at;
+
+    // Persist snapshot at finalize, or backfill once if already locked
+    if (usesFinalSnapshot && (life.didFinalize || isLocked) && !p.snapshot_results) {
+      p.snapshot_results = computeResults(db, p.id);
+      changedAny = true;
+    }
+
+    if (life.changed) changedAny = true;
+  }
+
+  if (changedAny) saveDB(db);
+
+  // Build response using authoritative results
   const polls = db.polls
     .filter(p => isVisibleInList(p, nowIso()))
     .map(p => ({
       ...p,
-      results: computeResults(db, p.id),
+      results: getAuthoritativeResults(db, p),
     }));
 
   res.json({ polls });
@@ -397,6 +413,7 @@ app.post("/api/polls", (req, res) => {
     closed_at: null,
     created_at: nowIso(),
     expires_at: req.body?.expires_at ? String(req.body.expires_at) : null,
+    cooldown_seconds: req.body?.cooldown_seconds ?? null,
     meta: req.body?.meta || {},
   };
 
@@ -481,11 +498,55 @@ app.post("/api/polls/:id/vote", (req, res) => {
   db.events.push({ kind: "vote_cast", poll_id: pollId, at: nowIso() });
   saveDB(db);
 
-  const results = computeResults(db, pollId);
+  const results = getAuthoritativeResults(db, poll);
   broadcast(pollId, "results", { poll_id: pollId, results });
 
   res.json({ ok: true, voter_token: ballotUid, results });
 });
+
+// Legitimacy Snapshot at Close
+function isLegitimacyPoll(poll) {
+  // Tag-driven classification (minimal “tags”, not a full tag system)
+  const tags = (poll && poll.meta && Array.isArray(poll.meta.tags)) ? poll.meta.tags : [];
+  const hasLegitimacyTag = tags.includes("legitimacy");
+
+  // If class explicitly set, honor it. Otherwise infer from tag.
+  const cls = poll && poll.poll_class;
+  if (cls === "LEGITIMACY") return true;
+
+  // Back-compat: if you still have GOV polls in test data, you can optionally count them here.
+  // If you do NOT want that, delete the next line.
+  if (cls === "GOVERNANCE") return true;
+
+  return !cls && hasLegitimacyTag;
+}
+
+function isLockedLegitimacy(poll) {
+  // “Lock moment” for this phase: finalized_at timestamp (and published_at is effectively same tick today)
+  return Boolean(poll && (poll.finalized_at || poll.published_at) && (poll.status === "finalized" || poll.status === "published"));
+}
+
+/**
+ * Returns authoritative results:
+ * - live computeResults before lock
+ * - snapshot_results after lock (and never drifts)
+ *
+ * If snapshot is missing post-lock, we compute it once and persist it (db is test junk per your note).
+ */
+function getAuthoritativeResults(db, poll) {
+  if (!poll) return { totals: {}, total_votes: 0 };
+
+  if (isLegitimacyPoll(poll) && isLockedLegitimacy(poll)) {
+    if (poll.snapshot_results) return poll.snapshot_results;
+
+    // Fallback: create snapshot if for some reason it wasn't persisted at lock time.
+    const snap = computeResults(db, poll.id);
+    poll.snapshot_results = snap;
+    return snap;
+  }
+
+  return computeResults(db, poll.id);
+}
 
 function computeResults(db, pollId) {
   const poll = db.polls.find(p => p.id === pollId);
