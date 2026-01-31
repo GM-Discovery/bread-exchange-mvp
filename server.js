@@ -18,10 +18,6 @@ const { nanoid } = require("nanoid");
 const fs = require("fs");
 const path = require("path");
 
-const { applyLifecycle, canVote, isVisibleInList, nowIso } = require("./lib/lifecycle");
-const STAMP_POOL_TARGET = 3;        // How many active stamps a persona should hold
-const STAMP_POOL_MAX = 7;           // Hard cap for active stamps per persona
-const STAMP_ROTATE_EVERY_USES = 1000; // Not implemented yet (skeleton only)
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
 
 // Header name is locked by your decision:
@@ -29,11 +25,101 @@ const STAMP_HEADER = "X-Stamp";
 
 const crypto = require("crypto");
 
-// Hash a stamp token so we never store plaintext tokens in db.json.
-// If db.json leaks, attackers still shouldn't get working stamps.
+// Hash for Stamp Tokens
 function hashStampToken(token) {
   return crypto.createHash("sha256").update(String(token)).digest("hex");
 }
+
+// ---- Config (loaded once at startup) ----
+// If config.js is missing or invalid, fall back to current behavior defaults.
+function loadConfig() {
+  const defaults = {
+    stamps: { pool_target: 3, pool_max: 7, rotate_every_uses: 1000 },
+    lifecycle: {
+      opinion_retention_seconds: 7 * 24 * 60 * 60,
+      governance_retention_seconds: 30 * 24 * 60 * 60,
+      governance_cooldown_seconds: 60 * 60,
+    },
+    security: { ballot_uid_salt: { min_length: 16, bytes: 32 } },
+  };
+
+  const cfgPath = path.join(__dirname, "config.js");
+  if (!fs.existsSync(cfgPath)) return defaults;
+
+  try {
+    const userCfg = require(cfgPath);
+    return mergeConfig(defaults, userCfg);
+  } catch (e) {
+    console.warn("[config] failed to load config.js; using defaults");
+    return defaults;
+  }
+}
+
+// Small object-only deep merge.
+// If a value is missing or invalid, default is preserved.
+function mergeConfig(base, override) {
+  if (!override || typeof override !== "object") return base;
+  const out = { ...base };
+
+  for (const k of Object.keys(base)) {
+    const bv = base[k];
+    const ov = override[k];
+
+    if (bv && typeof bv === "object" && !Array.isArray(bv)) {
+      out[k] = mergeConfig(bv, ov);
+    } else {
+      out[k] = ov === undefined ? bv : ov;
+    }
+  }
+  return out;
+}
+
+const cfg = loadConfig();
+// Load lifecycle as an object so we can call lifecycle.setDefaults(...)
+const lifecycle = require("./lib/lifecycle");
+const { applyLifecycle, canVote, isVisibleInList, nowIso } = lifecycle;
+
+// ---- Config fingerprint (safe subset only) ----
+// We fingerprint ONLY the safe public subset (stamps + lifecycle).
+function stableStringify(value) {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+
+  if (Array.isArray(value)) {
+    return "[" + value.map(stableStringify).join(",") + "]";
+  }
+
+  const keys = Object.keys(value).sort();
+  return "{" + keys.map(k => JSON.stringify(k) + ":" + stableStringify(value[k])).join(",") + "}";
+}
+
+// Safe public subset (also used by GET /api/config in Step 2)
+const CFG_PUBLIC = {
+  stamps: {
+    pool_target: cfg.stamps.pool_target,
+    pool_max: cfg.stamps.pool_max,
+    rotate_every_uses: cfg.stamps.rotate_every_uses,
+  },
+  lifecycle: {
+    opinion_retention_seconds: cfg.lifecycle.opinion_retention_seconds,
+    governance_retention_seconds: cfg.lifecycle.governance_retention_seconds,
+    governance_cooldown_seconds: cfg.lifecycle.governance_cooldown_seconds,
+  },
+};
+
+const CFG_FINGERPRINT = crypto
+  .createHash("sha256")
+  .update(stableStringify(CFG_PUBLIC))
+  .digest("hex");
+
+// Centralize lifecycle defaults (behavior unchanged with default config)
+if (typeof lifecycle.setDefaults === "function") {
+  lifecycle.setDefaults(cfg.lifecycle);
+}
+
+// Values now come from config (defaults match previous constants)
+const STAMP_POOL_TARGET = cfg.stamps.pool_target; // general average active signatures, too high = salt guesses too low = no vote
+const STAMP_POOL_MAX = cfg.stamps.pool_max; // max active signatures
+const STAMP_ROTATE_EVERY_USES = cfg.stamps.rotate_every_uses; // How many times a single stamp can be used on a vote
 
 /**
  * Ballot UID helpers
@@ -52,10 +138,10 @@ function getOrCreateBallotSalt(db) {
 
   // Look for an existing salt in db.keys (identity DB section)
   let rec = Array.isArray(db.keys) ? db.keys.find(k => k && k.kind === kind) : null;
-  if (rec && typeof rec.value === "string" && rec.value.length >= 16) return rec.value;
+  if (rec && typeof rec.value === "string" && rec.value.length >= cfg.security.ballot_uid_salt.min_length) return rec.value;
 
   // Create a new salt and persist it
-  const salt = crypto.randomBytes(32).toString("hex"); // 64 hex chars
+  const salt = crypto.randomBytes(cfg.security.ballot_uid_salt.bytes).toString("hex"); // default 32 bytes => 64 hex chars
   if (!Array.isArray(db.keys)) db.keys = [];
 
   db.keys.push({
@@ -277,6 +363,15 @@ app.use(express.static(path.join(__dirname, "public")));
 // ---- API ----
 app.get("/api/health", (req, res) => {
   res.json({ ok: true, time: nowIso() });
+});
+
+// Safe config introspection (no secrets).
+// Returns only the same safe subset used for fingerprinting.
+app.get("/api/config", (req, res) => {
+  res.json({
+    fingerprint: CFG_FINGERPRINT,
+    config: CFG_PUBLIC,
+  });
 });
 
 // ---- STAMP ISSUANCE ----
@@ -594,6 +689,8 @@ function computeResults(db, pollId) {
   };
 }
 
+// Log once at startup for “what config is live?” debugging
+console.log(`[config] fingerprint sha256=${CFG_FINGERPRINT}`);
 
 const PORT = process.env.PORT || 8787;
 app.listen(PORT, "0.0.0.0", () => {
