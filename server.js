@@ -25,6 +25,20 @@ const STAMP_HEADER = "X-Stamp";
 
 const crypto = require("crypto");
 
+const app = express();
+
+// CORS FIRST
+app.use(cors({
+  origin: true, // reflect origin
+  credentials: false,
+}));
+
+// PRE-FLIGHT MUST ALWAYS SUCCEED
+app.options("*", cors());
+
+// THEN body parsing
+app.use(express.json({ limit: "1mb" }));
+
 // Hash for Stamp Tokens
 function hashStampToken(token) {
   return crypto.createHash("sha256").update(String(token)).digest("hex");
@@ -121,6 +135,8 @@ const STAMP_POOL_TARGET = cfg.stamps.pool_target; // general average active sign
 const STAMP_POOL_MAX = cfg.stamps.pool_max; // max active signatures
 const STAMP_ROTATE_EVERY_USES = cfg.stamps.rotate_every_uses; // How many times a single stamp can be used on a vote
 
+
+
 /**
  * Ballot UID helpers
  *
@@ -212,8 +228,17 @@ function countActiveStamps(db, personaId) {
   return db.stamps.filter(s => s.persona_id === personaId && s.status === "ACTIVE").length;
 }
 
-const app = express();
-// app.use(cors());
+app.use((req, res, next) => {
+  console.log("[REQ]", req.method, req.url);
+  next();
+});
+
+// Enable CORS for browser clients (dev UI is on 127.0.0.1:1430)
+app.use(cors());
+
+// IMPORTANT: respond to preflight (OPTIONS) requests with 204/200
+app.options("*", cors());
+
 app.use(express.json({ limit: "1mb" }));
 
 const REQUIRE_KEY_SESSION = process.env.REQUIRE_KEY_SESSION === "1"; // reserved for later
@@ -484,6 +509,59 @@ app.get("/api/polls", (req, res) => {
     }));
 
   res.json({ polls });
+});
+
+app.get("/api/polls/:id/results", (req, res) => {
+  const pollId = req.params.id;
+  const db = loadDB();
+
+  const poll = db.polls.find(p => p.id === pollId);
+  if (!poll) return res.status(404).json({ error: "poll not found" });
+
+  const r = getAuthoritativeResults(db, poll);
+
+  // Legacy-friendly shape + keep modern fields
+  return res.json({
+    poll_id: pollId,
+    total_votes: r.total_votes,
+    counts: r.totals,              // legacy name
+    totals: r.totals,              // modern name
+    people_voted: r.people_voted,
+    represented_people: r.represented_people,
+    weights_used: r.weights_used,
+    validated: r.validated,
+  });
+});
+
+app.get("/api/polls/:id/stream", (req, res) => {
+  const pollId = req.params.id;
+  const db = loadDB();
+
+  const poll = db.polls.find(p => p.id === pollId);
+  if (!poll) return res.status(404).end();
+
+  // SSE headers
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders?.();
+
+  // Register subscriber
+  if (!subscribers.has(pollId)) subscribers.set(pollId, new Set());
+  subscribers.get(pollId).add(res);
+
+  // Send initial state on connect (so UI can render immediately)
+  sseSend(res, "poll", { poll });
+  sseSend(res, "results", { poll_id: pollId, results: getAuthoritativeResults(db, poll) });
+
+  // Cleanup on disconnect
+  req.on("close", () => {
+    const set = subscribers.get(pollId);
+    if (set) {
+      set.delete(res);
+      if (set.size === 0) subscribers.delete(pollId);
+    }
+  });
 });
 
 app.post("/api/polls", (req, res) => {
