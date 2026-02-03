@@ -25,6 +25,26 @@ const STAMP_HEADER = "X-Stamp";
 
 const crypto = require("crypto");
 
+// --- Persona-unique ballot UID (one persona -> one vote per poll) ---
+// This computes a stable, non-raw key for a (persona_id, poll_id) pair.
+function sha256Hex(s) {
+  return crypto.createHash("sha256").update(String(s), "utf8").digest("hex");
+}
+
+function getBallotSalt(db) {
+  return (
+    db?.keys?.ballot_uid_salt ||
+    process.env.BALLOT_UID_SALT ||
+    process.env.SERVER_SALT ||
+    "dev_salt_change_me"
+  );
+}
+
+function personaBallotUid(db, pollId, personaId) {
+  const salt = getBallotSalt(db);
+  return sha256Hex(`${personaId}:${pollId}:${salt}`);
+}
+
 const app = express();
 
 // CORS FIRST
@@ -436,7 +456,6 @@ app.post("/api/stamp", (req, res) => {
 
     return res.json({
       ok: true,
-      persona_id: personaId, // INTERNAL-ish; fine for now, remove later if you want less leakage
       issued,
       active_count: countActiveStamps(db, personaId),
       target: STAMP_POOL_TARGET,
@@ -466,7 +485,6 @@ app.post("/api/stamp", (req, res) => {
 
   return res.json({
     ok: true,
-    persona_id: personaId, // INTERNAL-ish; fine for now
     issued,                // empty array means "you already have enough"
     active_count: countActiveStamps(db, personaId),
     target: STAMP_POOL_TARGET,
@@ -643,13 +661,12 @@ app.post("/api/polls/:id/vote", (req, res) => {
 
   if (!canVote(poll)) return res.status(400).json({ error: "poll is closed" });
 
-  // Server-derived ballot identity (one per stamp per poll)
-  // NOTE: makeBallotUid() must already exist (we added it in Step 2).
-  const ballotUid = makeBallotUid(db, pollId, stampRec.token_hash);
+  // One persona -> one vote per poll (revote replaces)
+  const personaId = stampRec.persona_id;
+  const personaUid = personaBallotUid(db, pollId, personaId);
 
-  // One vote per ballotUid per poll: replace existing vote from same ballotUid
-  const prev = db.votes.find(v => v.poll_id === pollId && v.voter_token === ballotUid);
-  db.votes = db.votes.filter(v => !(v.poll_id === pollId && v.voter_token === ballotUid));
+  const prev = db.votes.find(v => v.poll_id === pollId && (v.persona_ballot_uid === personaUid || v.voter_token === personaUid));
+  db.votes = db.votes.filter(v => !(v.poll_id === pollId && (v.persona_ballot_uid === personaUid || v.voter_token === personaUid)));
 
   db.votes.push({
     id: nanoid(12),
@@ -658,7 +675,8 @@ app.post("/api/polls/:id/vote", (req, res) => {
 
     // Stored as voter_token for backward compatibility with existing API shape.
     // Semantically this is the ballot_uid.
-    voter_token: ballotUid,
+    voter_token: personaUid,
+    persona_ballot_uid: personaUid,
 
     // Authoritative stamp weight used for tally.
     weight,
@@ -674,7 +692,7 @@ app.post("/api/polls/:id/vote", (req, res) => {
   const results = getAuthoritativeResults(db, poll);
   broadcast(pollId, "results", { poll_id: pollId, results });
 
-  res.json({ ok: true, voter_token: ballotUid, results });
+  res.json({ ok: true, voter_token: personaUid, results });
 });
 
 // Legitimacy Snapshot at Close
@@ -759,7 +777,9 @@ function computeResults(db, pollId) {
     total_votes: votes.length,
 
     // New explicit fields
-    people_voted: votes.length,        // one stored vote per ballotUid (unique stamp per poll)
+    people_voted: new Set(
+      votes.map(v => v.persona_ballot_uid || v.voter_token).filter(Boolean)
+    ).size,       // one stored vote per ballotUid (unique stamp per poll)
     represented_people: wSum,          // sum of weights
     weights_used: { min: wMin, max: wMax, sum: wSum, count: wCount },
 
