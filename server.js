@@ -22,6 +22,8 @@ const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
 
 // Header name is locked by your decision:
 const STAMP_HEADER = "X-Stamp";
+// self_id proof header (private secret; never public; store hashed only)
+const SELF_ID_HEADER = "X-Self-ID";
 
 const crypto = require("crypto");
 
@@ -272,6 +274,10 @@ const LEGACY_DB_PATH = path.join(DATA_DIR, "db.json");
 const EXCHANGE_DB_PATH = path.join(DATA_DIR, "exchange.private.json"); // polls/votes/events
 const IDENTITY_DB_PATH = path.join(DATA_DIR, "identity.private.json"); // personas/stamps (+future)
 
+// NEW: identity layer stores (operator-readable state + append-only ledger)
+const IDENTITY_STATE_PATH = path.join(DATA_DIR, "identity.state.json");
+const IDENTITY_LEDGER_PATH = path.join(DATA_DIR, "identity.ledger.json");
+
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 function readJsonOrInit(filePath, emptyObj) {
@@ -419,49 +425,255 @@ app.get("/api/config", (req, res) => {
   });
 });
 
+////////////////////////////////////////////////////////////////////////////////
+// IDENTITY API v0 (backend-only primitives)
+//
+// Public:
+// - GET  /api/identity/challenge   (PoW-lite challenge)
+// - POST /api/identity/create      (verify PoW + create identity)
+// Operator-gated (via Caddy Basic Auth OR optional OPERATOR_KEY header):
+// - POST /api/identity/grant-trust (set earned/personal points; ledgered)
+////////////////////////////////////////////////////////////////////////////////
+
+// Tunables (env override if needed)
+const POW_DIFFICULTY = Number(process.env.POW_DIFFICULTY ?? 3); // leading hex zeros
+const POW_TTL_MS = Number(process.env.POW_TTL_MS ?? (10 * 60 * 1000)); // 10 minutes
+const IDENTITY_CREATE_RL_LIMIT = Number(process.env.IDENTITY_CREATE_RL_LIMIT ?? 10); // per hour per IP
+const IDENTITY_CREATE_RL_WINDOW = Number(process.env.IDENTITY_CREATE_RL_WINDOW ?? (60 * 60 * 1000));
+const IDENTITY_CHALLENGE_RL_LIMIT = Number(process.env.IDENTITY_CHALLENGE_RL_LIMIT ?? 30); // per hour per IP
+const IDENTITY_CHALLENGE_RL_WINDOW = Number(process.env.IDENTITY_CHALLENGE_RL_WINDOW ?? (60 * 60 * 1000));
+
+app.get("/api/identity/challenge", (req, res) => {
+  const ip = req.ip || "unknown";
+
+  // Soft rate limit to prevent challenge spamming.
+  if (rateLimitHit(`id_chal:${ip}`, IDENTITY_CHALLENGE_RL_LIMIT, IDENTITY_CHALLENGE_RL_WINDOW)) {
+    return res.status(429).json({ error: "rate_limited" });
+  }
+
+  const db = loadDB();
+
+  // Store challenges in identity.private.json's challenges[] (already present in your split DB).
+  const challenge = "chal_" + crypto.randomBytes(16).toString("hex");
+  const rec = {
+    id: "pow_" + nanoid(10),
+    challenge,
+    difficulty: POW_DIFFICULTY,
+    created_at: nowIso(),
+    expires_at: new Date(Date.now() + POW_TTL_MS).toISOString(),
+    ip,
+    used: false,
+  };
+
+  db.challenges.push(rec);
+  saveDB(db);
+
+  // Client solves: find nonce where sha256(challenge + ":" + nonce) starts with N zeros.
+  return res.json({
+    ok: true,
+    challenge,
+    difficulty: POW_DIFFICULTY,
+    expires_at: rec.expires_at,
+  });
+});
+
+app.post("/api/identity/create", (req, res) => {
+  const ip = req.ip || "unknown";
+
+  if (rateLimitHit(`id_create:${ip}`, IDENTITY_CREATE_RL_LIMIT, IDENTITY_CREATE_RL_WINDOW)) {
+    return res.status(429).json({ error: "rate_limited" });
+  }
+
+  const { challenge, nonce } = req.body || {};
+  if (!challenge || nonce === undefined || nonce === null) {
+    return res.status(400).json({ error: "challenge and nonce are required" });
+  }
+
+  const db = loadDB();
+
+  // Find a live, unused challenge
+  const rec = (db.challenges || []).find(c =>
+    c &&
+    c.challenge === String(challenge) &&
+    c.used !== true &&
+    c.ip === ip
+  );
+
+  if (!rec) return res.status(403).json({ error: "invalid_challenge" });
+
+  const expMs = Date.parse(String(rec.expires_at || ""));
+  if (!Number.isFinite(expMs) || Date.now() > expMs) {
+    rec.used = true;
+    saveDB(db);
+    return res.status(403).json({ error: "challenge_expired" });
+  }
+
+  // Verify PoW
+  if (!verifyPow(rec.challenge, nonce, rec.difficulty)) {
+    return res.status(403).json({ error: "invalid_pow" });
+  }
+
+  // Mark challenge used (prevents replay)
+  rec.used = true;
+  saveDB(db);
+
+  // Create identity
+  const self_id = generateSelfId();
+  const public_alias = generatePublicAlias();
+
+  const internal_id = "id_" + nanoid(12);
+  const self_id_hash = hashSelfId(self_id);
+
+  const state = readIdentityState();
+
+  // Defensive: ensure arrays/maps exist
+  if (!Array.isArray(state.identities)) state.identities = [];
+  if (!state.aliases || typeof state.aliases !== "object") state.aliases = {};
+  if (!state.self_index || typeof state.self_index !== "object") state.self_index = {};
+
+  const now = nowIso();
+
+  state.identities.push({
+    internal_id,
+    self_id_hash,       // hashed at rest
+    public_alias,
+    display_name: null,
+    earned_personal: 0, // operator grants up to 10 later
+    tags: [],
+    status: "ACTIVE",
+    created_at: now,
+    updated_at: now,
+  });
+
+  state.aliases[public_alias] = internal_id;
+  state.self_index[self_id_hash] = internal_id;
+
+  writeIdentityState(state);
+
+  appendIdentityLedgerEvent({
+    id: "evt_" + nanoid(12),
+    ts: now,
+    type: "IDENTITY_CREATED",
+    internal_id,
+    delta_weight: 0,
+    meta: { by: "system", ip },
+  });
+
+  // DO NOT return internal_id.
+  return res.json({ ok: true, self_id, public_alias });
+});
+
+app.post("/api/identity/grant-trust", (req, res) => {
+  // v0 security:
+  // - You said "Fine, basic auth" — so this endpoint should be gated by Caddy Basic Auth.
+  // - Optionally you can also set OPERATOR_KEY and require X-Operator-Key.
+  const operatorKey = process.env.OPERATOR_KEY;
+  if (operatorKey) {
+    const presented = req.get("X-Operator-Key");
+    if (presented !== operatorKey) return res.status(401).json({ error: "unauthorized" });
+  }
+
+  const { public_alias, delta_earned, reason } = req.body || {};
+  if (!public_alias || !Number.isFinite(Number(delta_earned))) {
+    return res.status(400).json({ error: "public_alias and delta_earned are required" });
+  }
+
+  const state = readIdentityState();
+  const identity = findIdentityByAlias(state, public_alias);
+  if (!identity) return res.status(404).json({ error: "identity_not_found" });
+
+  const before = clampEarnedPersonal(identity.earned_personal ?? 0);
+  const after = clampEarnedPersonal(before + Number(delta_earned));
+  identity.earned_personal = after;
+  identity.updated_at = nowIso();
+
+  writeIdentityState(state);
+
+  appendIdentityLedgerEvent({
+    id: "evt_" + nanoid(12),
+    ts: nowIso(),
+    type: "EARNED_TRUST",
+    internal_id: identity.internal_id,
+    delta_weight: after - before,
+    meta: { by: "operator", reason: reason ? String(reason).slice(0, 500) : "" },
+  });
+
+  return res.json({ ok: true, new_earned_personal: after });
+});
+
+app.post("/api/stamp", (req, res) => {
+  const db = loadDB();
+
+  let personaId = null;
+  const presented = req.get(STAMP_HEADER);
+  if (presented) {
+    const stampRec = findStampByToken(db, presented);
+    if (stampRec) personaId = stampRec.persona_id;
+  }
+
 // ---- STAMP ISSUANCE ----
 // Uses existing Caddy Basic Auth gate (treat as a "write").
 // Behavior:
 // - If client provides a valid X-Stamp -> resolve persona, top up if below target
 // - If no/invalid stamp -> create new persona, issue target stamps
-app.post("/api/stamp", (req, res) => {
-  const presented = req.get(STAMP_HEADER); // "X-Stamp"
-  const db = loadDB();
+// If no valid stamp, create a brand new persona OR an identity-bound persona
+if (!personaId) {
+  // Optional identity proof:
+  // - If X-Self-ID is present and valid, we mint a stamp whose weight is derived from identity.
+  // - If absent, we mint an anonymous stamp (weight=1).
+  const selfIdRaw = req.get(SELF_ID_HEADER); // "X-Self-ID" (private secret)
+  let issuedWeight = 1.0;                   // anonymous default
 
-  // Try to resolve existing persona from presented stamp (if any)
-  let personaId = null;
-  if (presented) {
-    const stampRec = findStampByToken(db, presented);
-    if (stampRec) {
-      personaId = stampRec.persona_id;
-      // (Optional) track last-used time (doesn't change behavior yet)
-      stampRec.last_used_at = nowIso();
+  if (selfIdRaw) {
+    const state = readIdentityState();
+    const selfHash = hashSelfId(selfIdRaw);
+    const identity = findIdentityBySelfIdHash(state, selfHash);
+
+    if (!identity) {
+      // IMPORTANT: do not reveal whether a self_id exists.
+      // We simply deny weighted issuance (client can retry anonymous).
+      return res.status(403).json({ error: "invalid self_id" });
     }
-  }
 
-  // If no valid stamp, create a brand new persona (MVP "no recovery" model)
-  if (!personaId) {
-    const persona = createPersona(db);
+    // Find or create a persona bound to this identity (server-only).
+    const persona = findOrCreatePersonaForIdentity(db, identity.internal_id);
     personaId = persona.id;
 
-    // Issue initial pool
-    const issued = [];
-    const toIssue = Math.min(STAMP_POOL_TARGET, STAMP_POOL_MAX);
-    for (let i = 0; i < toIssue; i++) {
-      issued.push(issueOneStamp(db, personaId, req.body));
-    }
-
-    db.events.push({ kind: "stamp_issued", persona_id: personaId, at: nowIso(), count: issued.length });
-    saveDB(db);
-
-    return res.json({
-      ok: true,
-      issued,
-      active_count: countActiveStamps(db, personaId),
-      target: STAMP_POOL_TARGET,
-      max: STAMP_POOL_MAX,
-    });
+    // Snapshot weight for this stamp issuance.
+    issuedWeight = computeStampSnapshotWeightFromIdentity(state, identity);
+  } else {
+    // Anonymous persona (no recovery model)
+    const persona = createPersona(db);
+    personaId = persona.id;
+    issuedWeight = 1.0;
   }
+
+// Issue initial pool — stamp is authoritative, so we write weight onto stamp records now.
+  const issued = [];
+  const toIssue = Math.min(STAMP_POOL_TARGET, STAMP_POOL_MAX);
+
+  for (let i = 0; i < toIssue; i++) {
+    issued.push(issueOneStamp(db, personaId, { weight: issuedWeight, tags: [] }));
+  }
+
+  db.events.push({
+    kind: "stamp_issued",
+    persona_id: personaId,
+    at: nowIso(),
+    count: issued.length,
+    note: selfIdRaw ? "identity_weighted" : "anonymous",
+  });
+
+  saveDB(db);
+
+  return res.json({
+    ok: true,
+    issued,
+    active_count: countActiveStamps(db, personaId),
+    target: STAMP_POOL_TARGET,
+    max: STAMP_POOL_MAX,
+  });
+}
 
   // Persona exists: top-up logic (rotation later)
   const active = countActiveStamps(db, personaId);
@@ -474,7 +686,12 @@ app.post("/api/stamp", (req, res) => {
   const toIssue = Math.min(room, need);
 
   for (let i = 0; i < toIssue; i++) {
-    issued.push(issueOneStamp(db, personaId, req.body));
+    // IMPORTANT:
+    // - We do not trust client-supplied weights.
+    // - For top-ups, we keep existing behavior simple: mint anonymous stamps weight=1.
+    // If you later want identity-weighted top-ups for an identity persona, we can detect
+    // persona.meta.identity_internal_id and compute weight from identity state here too.
+    issued.push(issueOneStamp(db, personaId, { weight: 1.0, tags: [] }));
   }
 
   if (issued.length > 0) {
@@ -785,6 +1002,148 @@ function computeResults(db, pollId) {
 
     validated: true,
   };
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// IDENTITY LAYER v0 — helpers (backend-only)
+// Semantics lock:
+// - Votes use stampRec.weight ONLY (stamp is authoritative audit artifact).
+// - Identity is consulted ONLY at stamp issuance time to SET stamp weight.
+// - self_id is a *private stable secret* held by the user (stored hashed at rest).
+// - public_alias is a rotatable *public handle* (not a secret).
+// - internal_id is server-only and never exposed.
+////////////////////////////////////////////////////////////////////////////////
+
+// New stores (operator-readable, but still permissioned by ops practice)
+// NOTE: These constants are defined up top in the persistence section.
+// We reference them here via function hoisting / module scope:
+//   IDENTITY_STATE_PATH, IDENTITY_LEDGER_PATH
+
+// ---- Self-ID hashing (store only hashes at rest) ----
+function hashSelfId(selfIdRaw) {
+  // IMPORTANT: never store plaintext self_id.
+  return crypto.createHash("sha256").update(String(selfIdRaw), "utf8").digest("hex");
+}
+
+// ---- Identity State + Ledger IO ----
+function readIdentityState() {
+  // State is a cache for fast reads; ledger is the audit source of truth.
+  // We keep state consistent by always writing state + ledger in the same request.
+  return readJsonOrInit(IDENTITY_STATE_PATH, {
+    identities: [],
+    aliases: {},     // public_alias -> internal_id
+    // Optional, helps fast lookup without scanning arrays:
+    self_index: {},  // self_id_hash -> internal_id
+  });
+}
+
+function writeIdentityState(state) {
+  writeJson(IDENTITY_STATE_PATH, state);
+}
+
+function readIdentityLedger() {
+  return readJsonOrInit(IDENTITY_LEDGER_PATH, { events: [] });
+}
+
+function appendIdentityLedgerEvent(evt) {
+  const ledger = readIdentityLedger();
+  if (!Array.isArray(ledger.events)) ledger.events = [];
+  ledger.events.push(evt);
+  writeJson(IDENTITY_LEDGER_PATH, ledger);
+}
+
+// ---- Lookup helpers ----
+function findIdentityBySelfIdHash(state, selfIdHash) {
+  const internalId = state?.self_index?.[selfIdHash];
+  if (!internalId) return null;
+  return (state.identities || []).find(x => x && x.internal_id === internalId) || null;
+}
+
+function findIdentityByAlias(state, alias) {
+  const internalId = state?.aliases?.[String(alias || "")];
+  if (!internalId) return null;
+  return (state.identities || []).find(x => x && x.internal_id === internalId) || null;
+}
+
+// ---- Weight math (v0: delegations deferred) ----
+// You explicitly defined:
+// - earned/personal points capped at 10
+// - delegations are transitive split graph, but implementation can come later.
+// For now we return 0 delegated weight until the delegation kernel lands.
+function computeDelegatedInWeight_v0_unused(/* state, internalId */) {
+  return 0;
+}
+
+function clampEarnedPersonal(x) {
+  // Earned/personal points are capped at 10 by your rule.
+  const n = Number(x);
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0, Math.min(10, n));
+}
+
+function computeStampSnapshotWeightFromIdentity(state, identityRec) {
+  // IMPORTANT: stamp remains authoritative, so this is a snapshot at issuance.
+  const earned = clampEarnedPersonal(identityRec?.earned_personal ?? identityRec?.weight ?? 0);
+  const delegated = computeDelegatedInWeight_v0_unused(state, identityRec?.internal_id);
+  const total = earned + delegated;
+
+  // High precision allowed; we store the numeric result on the stamp record.
+  return Number(total);
+}
+
+// ---- Persona binding (identity -> persona is internal only) ----
+function findOrCreatePersonaForIdentity(db, identityInternalId) {
+  // We keep persona internal; client never sees persona IDs.
+  // We store linkage on persona.meta.identity_internal_id (server-only).
+  const existing = (db.personas || []).find(p => p?.meta?.identity_internal_id === identityInternalId);
+  if (existing) return existing;
+
+  const persona = createPersona(db);
+  if (!persona.meta || typeof persona.meta !== "object") persona.meta = {};
+  persona.meta.identity_internal_id = identityInternalId;
+  return persona;
+}
+
+// ---- Simple in-memory rate limit (resets on restart; good enough for MVP) ----
+const _rl = new Map(); // key -> { count, resetAtMs }
+
+function rateLimitHit(key, limit, windowMs) {
+  const now = Date.now();
+  const rec = _rl.get(key);
+  if (!rec || now >= rec.resetAtMs) {
+    _rl.set(key, { count: 1, resetAtMs: now + windowMs });
+    return false; // not limited
+  }
+  rec.count += 1;
+  return rec.count > limit;
+}
+
+// ---- PoW-lite (Hashcash-style) ----
+// We use "leading hex zeros" as the difficulty measure.
+// Example difficulty=3 => hash must start with "000" (roughly 4096 trials on average).
+function powHash(challenge, nonce) {
+  return crypto
+    .createHash("sha256")
+    .update(`${String(challenge)}:${String(nonce)}`, "utf8")
+    .digest("hex");
+}
+
+function verifyPow(challenge, nonce, difficulty) {
+  const d = Number(difficulty);
+  if (!Number.isFinite(d) || d < 0 || d > 10) return false; // sanity cap
+  const h = powHash(challenge, nonce);
+  return h.startsWith("0".repeat(d));
+}
+
+// Helper to generate safe random tokens for self_id
+function generateSelfId() {
+  // Long-lived secret the user stores.
+  return "self_" + crypto.randomBytes(24).toString("hex");
+}
+
+function generatePublicAlias() {
+  // Rotatable public handle.
+  return "a_" + nanoid(12);
 }
 
 // Log once at startup for “what config is live?” debugging

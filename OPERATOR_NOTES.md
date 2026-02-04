@@ -262,3 +262,94 @@ Stamp rotation enforcement (config knob exists only)
 
 Only /data is mounted.
 All application code is baked into the image and requires a rebuild to change behavior.
+
+Technical Stuff:
+
+root@The-Bread-Standard-First-Exchange:/opt/bread-poll-mvp# docker compose config | sed -n '/bread-exchange:/,/^[^ ]/p'
+  bread-exchange:
+    build:
+      context: /opt/bread-exchange-mvp
+      dockerfile: Dockerfile
+    container_name: bread-exchange
+    expose:
+      - "8787"
+    networks:
+      default: null
+    restart: unless-stopped
+    volumes:
+      - type: bind
+        source: /root/bread-exchange-data
+        target: /app/data
+        bind: {}
+  caddy:
+    depends_on:
+      api:
+        condition: service_started
+        required: true
+      web:
+        condition: service_started
+        required: true
+    image: caddy:alpine
+    networks:
+      default: null
+    ports:
+      - mode: ingress
+        target: 80
+        published: "80"
+        protocol: tcp
+      - mode: ingress
+        target: 443
+        published: "443"
+        protocol: tcp
+    restart: unless-stopped
+    volumes:
+      - type: bind
+        source: /opt/bread-poll-mvp/Caddyfile
+        target: /etc/caddy/Caddyfile
+        bind: {}
+      - type: volume
+        source: caddy_data
+        target: /data
+        volume: {}
+      - type: volume
+        source: caddy_config
+        target: /config
+        volume: {}
+  db:
+    container_name: bread_poll_db
+    environment:
+      POSTGRES_DB: breadpoll
+      POSTGRES_PASSWORD: breadpoll_dev_password
+      POSTGRES_USER: breadpoll
+    image: postgres:16
+    networks:
+      default: null
+    restart: unless-stopped
+    volumes:
+      - type: volume
+        source: db_data
+        target: /var/lib/postgresql/data
+        volume: {}
+  web:
+    container_name: bread_poll_web
+    image: nginx:alpine
+    networks:
+      default: null
+    ports:
+      - mode: ingress
+        target: 80
+        published: "8080"
+        protocol: tcp
+    restart: unless-stopped
+    volumes:
+      - type: bind
+        source: /opt/bread-poll-mvp/web
+        target: /usr/share/nginx/html
+        read_only: true
+        bind: {}
+      - type: bind
+        source: /opt/bread-poll-mvp/nginx/default.conf
+        target: /etc/nginx/conf.d/default.conf
+        read_only: true
+        bind: {}
+networks:
