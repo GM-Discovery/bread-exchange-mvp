@@ -11,12 +11,12 @@
 module.exports = {
   stamps: {
     // Current behavior in server.js:
-    // STAMP_POOL_TARGET = 3
-    // STAMP_POOL_MAX = 7
-    // STAMP_ROTATE_EVERY_USES = 1000 (skeleton only)
-    pool_target: 3,
-    pool_max: 7,
-    rotate_every_uses: 1000,
+    // STAMP_POOL_TARGET = 1
+    // STAMP_POOL_MAX = 1
+    // STAMP_ROTATE_EVERY_USES = 1 (skeleton only)
+    pool_target: 1,
+    pool_max: 1,
+    rotate_every_uses: 1,
   },
 
   lifecycle: {

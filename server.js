@@ -538,7 +538,7 @@ app.post("/api/identity/create", (req, res) => {
     self_id_hash,       // hashed at rest
     public_alias,
     display_name: null,
-    earned_personal: 0, // operator grants up to 10 later
+    earned_personal: 1, // operator grants up to 10 later
     tags: [],
     status: "ACTIVE",
     created_at: now,
@@ -555,7 +555,7 @@ app.post("/api/identity/create", (req, res) => {
     ts: now,
     type: "IDENTITY_CREATED",
     internal_id,
-    delta_weight: 0,
+    delta_weight: delta,
     meta: { by: "system", ip },
   });
 
@@ -565,25 +565,39 @@ app.post("/api/identity/create", (req, res) => {
 
 app.post("/api/identity/grant-trust", (req, res) => {
   // v0 security:
-  // - You said "Fine, basic auth" — so this endpoint should be gated by Caddy Basic Auth.
-  // - Optionally you can also set OPERATOR_KEY and require X-Operator-Key.
+  // Require OPERATOR_KEY and require X-Operator-Key.
   const operatorKey = process.env.OPERATOR_KEY;
   if (operatorKey) {
     const presented = req.get("X-Operator-Key");
     if (presented !== operatorKey) return res.status(401).json({ error: "unauthorized" });
   }
 
-  const { public_alias, delta_earned, reason } = req.body || {};
-  if (!public_alias || !Number.isFinite(Number(delta_earned))) {
-    return res.status(400).json({ error: "public_alias and delta_earned are required" });
+  // Expect an explicit personal weight change (earned trust)
+  const { public_alias, weight_delta, reason } = req.body || {};
+
+  // Validate required fields
+  if (!public_alias || !Number.isFinite(Number(weight_delta))) {
+    return res.status(400).json({
+      error: "public_alias and weight_delta are required"
+    });
   }
 
+  const delta = Number(weight_delta);
+
+  // Allow adjustments up or down, but require an explicit non-zero integer
+  if (!Number.isInteger(delta) || delta === 0) {
+    return res.status(400).json({
+      error: "weight_delta must be a non-zero integer"
+    });
+  }
+
+  const eventType = delta > 0 ? "EARNED_TRUST" : "TRUST_ADJUST";
   const state = readIdentityState();
   const identity = findIdentityByAlias(state, public_alias);
   if (!identity) return res.status(404).json({ error: "identity_not_found" });
 
-  const before = clampEarnedPersonal(identity.earned_personal ?? 0);
-  const after = clampEarnedPersonal(before + Number(delta_earned));
+  const before = clampEarnedPersonal(identity.earned_personal ?? 1);
+  const after = clampEarnedPersonal(Math.max(1, before + delta));
   identity.earned_personal = after;
   identity.updated_at = nowIso();
 
@@ -592,10 +606,14 @@ app.post("/api/identity/grant-trust", (req, res) => {
   appendIdentityLedgerEvent({
     id: "evt_" + nanoid(12),
     ts: nowIso(),
-    type: "EARNED_TRUST",
+    type: eventType,
     internal_id: identity.internal_id,
-    delta_weight: after - before,
-    meta: { by: "operator", reason: reason ? String(reason).slice(0, 500) : "" },
+    delta_weight: delta,
+    meta: {
+      by: "operator",
+      reason: reason ? String(reason).slice(0, 500) : "",
+      applied_delta: after - before
+    },
   });
 
   return res.json({ ok: true, new_earned_personal: after });
@@ -613,16 +631,15 @@ app.post("/api/stamp", (req, res) => {
 
 // ---- STAMP ISSUANCE ----
 // Uses existing Caddy Basic Auth gate (treat as a "write").
-// Behavior:
 // - If client provides a valid X-Stamp -> resolve persona, top up if below target
 // - If no/invalid stamp -> create new persona, issue target stamps
-// If no valid stamp, create a brand new persona OR an identity-bound persona
 if (!personaId) {
   // Optional identity proof:
   // - If X-Self-ID is present and valid, we mint a stamp whose weight is derived from identity.
   // - If absent, we mint an anonymous stamp (weight=1).
   const selfIdRaw = req.get(SELF_ID_HEADER); // "X-Self-ID" (private secret)
   let issuedWeight = 1.0;                   // anonymous default
+  let issuedTags = [];                      // snapshot tags written onto stamps
 
   if (selfIdRaw) {
     const state = readIdentityState();
@@ -641,6 +658,7 @@ if (!personaId) {
 
     // Snapshot weight for this stamp issuance.
     issuedWeight = computeStampSnapshotWeightFromIdentity(state, identity);
+      if (Array.isArray(identity.tags)) issuedTags = identity.tags.slice(0, 50);
   } else {
     // Anonymous persona (no recovery model)
     const persona = createPersona(db);
@@ -648,27 +666,39 @@ if (!personaId) {
     issuedWeight = 1.0;
   }
 
-// Issue initial pool — stamp is authoritative, so we write weight onto stamp records now.
+  // Issue pool with enforcement (identity persona may already have active stamps).
+  // This prevents active_count from exceeding pool_max when pool_max is small.
+  const active = countActiveStamps(db, personaId);
   const issued = [];
-  const toIssue = Math.min(STAMP_POOL_TARGET, STAMP_POOL_MAX);
+
+  const desired = Math.min(STAMP_POOL_TARGET, STAMP_POOL_MAX);
+  const room = Math.max(0, STAMP_POOL_MAX - active);
+  const need = Math.max(0, desired - active);
+  const toIssue = Math.min(room, need);
 
   for (let i = 0; i < toIssue; i++) {
-    issued.push(issueOneStamp(db, personaId, { weight: issuedWeight, tags: [] }));
+    // Stamp remains authoritative: snapshot weight/tags on the stamp record now.
+    issued.push(issueOneStamp(db, personaId, { weight: issuedWeight, tags: issuedTags }));
   }
 
-  db.events.push({
-    kind: "stamp_issued",
-    persona_id: personaId,
-    at: nowIso(),
-    count: issued.length,
-    note: selfIdRaw ? "identity_weighted" : "anonymous",
-  });
+  if (issued.length > 0) {
+    db.events.push({
+      kind: "stamp_issued",
+      persona_id: personaId,
+      at: nowIso(),
+      count: issued.length,
+      note: selfIdRaw ? "identity_weighted" : "anonymous",
+      weight: issuedWeight,
+    });
+  }
 
   saveDB(db);
 
   return res.json({
     ok: true,
     issued,
+    issued_weight: issued.length > 0 ? issuedWeight : null,
+    issued_tags: issued.length > 0 ? issuedTags : null,
     active_count: countActiveStamps(db, personaId),
     target: STAMP_POOL_TARGET,
     max: STAMP_POOL_MAX,
@@ -685,13 +715,29 @@ if (!personaId) {
   const need = Math.max(0, desired - active);
   const toIssue = Math.min(room, need);
 
+  // Decide weight/tags for THIS issuance (top-up is still "issuance")
+  let topUpWeight = 1.0;
+  let topUpTags = [];
+
+  // If this persona is identity-bound, use identity state to snapshot the weight now.
+  const personaRec = (db.personas || []).find(p => p && p.id === personaId) || null;
+  const identityInternalId = personaRec?.meta?.identity_internal_id;
+
+  if (identityInternalId) {
+    const state = readIdentityState();
+    const identity = findIdentityByInternalId(state, identityInternalId);
+
+    if (identity) {
+      topUpWeight = computeStampSnapshotWeightFromIdentity(state, identity);
+
+      // Tags are not secret; snapshot what’s on identity state at issuance.
+      if (Array.isArray(identity.tags)) topUpTags = identity.tags.slice(0, 50);
+    }
+  }
+
   for (let i = 0; i < toIssue; i++) {
-    // IMPORTANT:
-    // - We do not trust client-supplied weights.
-    // - For top-ups, we keep existing behavior simple: mint anonymous stamps weight=1.
-    // If you later want identity-weighted top-ups for an identity persona, we can detect
-    // persona.meta.identity_internal_id and compute weight from identity state here too.
-    issued.push(issueOneStamp(db, personaId, { weight: 1.0, tags: [] }));
+    // Stamp remains authoritative: write snapshot weight/tags onto stamp record.
+    issued.push(issueOneStamp(db, personaId, { weight: topUpWeight, tags: topUpTags }));
   }
 
   if (issued.length > 0) {
@@ -703,6 +749,8 @@ if (!personaId) {
   return res.json({
     ok: true,
     issued,                // empty array means "you already have enough"
+    issued_weight: issued.length > 0 ? topUpWeight : null,
+    issued_tags: issued.length > 0 ? topUpTags : null,
     active_count: countActiveStamps(db, personaId),
     target: STAMP_POOL_TARGET,
     max: STAMP_POOL_MAX,
@@ -1065,10 +1113,14 @@ function findIdentityByAlias(state, alias) {
   return (state.identities || []).find(x => x && x.internal_id === internalId) || null;
 }
 
+function findIdentityByInternalId(state, internalId) {
+  // Helper for internal-only lookups (server-only stable id).
+  if (!internalId) return null;
+  return (state.identities || []).find(x => x && x.internal_id === String(internalId)) || null;
+}
+
 // ---- Weight math (v0: delegations deferred) ----
-// You explicitly defined:
 // - earned/personal points capped at 10
-// - delegations are transitive split graph, but implementation can come later.
 // For now we return 0 delegated weight until the delegation kernel lands.
 function computeDelegatedInWeight_v0_unused(/* state, internalId */) {
   return 0;
@@ -1083,12 +1135,14 @@ function clampEarnedPersonal(x) {
 
 function computeStampSnapshotWeightFromIdentity(state, identityRec) {
   // IMPORTANT: stamp remains authoritative, so this is a snapshot at issuance.
+  // - Identity-based stamps must not mint with weight < 1.
   const earned = clampEarnedPersonal(identityRec?.earned_personal ?? identityRec?.weight ?? 0);
   const delegated = computeDelegatedInWeight_v0_unused(state, identityRec?.internal_id);
   const total = earned + delegated;
 
   // High precision allowed; we store the numeric result on the stamp record.
-  return Number(total);
+  const raw = Number(total) || 0;
+  return Math.max(1, raw);
 }
 
 // ---- Persona binding (identity -> persona is internal only) ----
