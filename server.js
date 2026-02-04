@@ -22,6 +22,7 @@ const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
 
 // Header name is locked by your decision:
 const STAMP_HEADER = "X-Stamp";
+const VOTER_TOKEN_HEADER = "X-Voter-Token";
 // self_id proof header (private secret; never public; store hashed only)
 const SELF_ID_HEADER = "X-Self-ID";
 
@@ -888,12 +889,69 @@ app.post("/api/polls/:id/vote", (req, res) => {
 
   const db = loadDB();
 
-  // ---- STAMP REQUIRED (MVP) ----
-  const presented = req.get(STAMP_HEADER); // "X-Stamp"
-  if (!presented) return res.status(401).json({ error: "missing X-Stamp" });
+  // If present, X-Voter-Token is a poll-scoped revote capability.
+  // It must ONLY be allowed to REPLACE an existing vote on the same poll.
+  const presentedVoterToken = req.get(VOTER_TOKEN_HEADER);
 
-  // Stamp must exist
-  const stampRec = findStampByToken(db, presented);
+  // Poll must exist (both first-vote and revote paths need it)
+  const poll = db.polls.find(p => p.id === pollId);
+  if (!poll) return res.status(404).json({ error: "poll not found" });
+
+  // Apply lifecycle on access
+  const life = applyLifecycle(poll, nowIso());
+  if (life.changed) saveDB(db);
+
+  if (!canVote(poll)) return res.status(400).json({ error: "poll is closed" });
+
+  // ----------------------------
+  // REVOTE PATH (no stamp)
+  // ----------------------------
+  if (presentedVoterToken) {
+    const token = String(presentedVoterToken);
+
+    // Must already have an existing vote for this poll + token.
+    const prev = db.votes.find(v =>
+      v.poll_id === pollId &&
+      (v.persona_ballot_uid === token || v.voter_token === token)
+    );
+
+    if (!prev) {
+      // Critical safety: do NOT allow X-Voter-Token to create a first vote.
+      return res.status(403).json({ error: "invalid X-Voter-Token" });
+    }
+
+    // Replace vote (no amplification): remove any existing row for this token+poll, then reinsert updated record.
+    db.votes = db.votes.filter(v =>
+      !(v.poll_id === pollId && (v.persona_ballot_uid === token || v.voter_token === token))
+    );
+
+    db.votes.push({
+      ...prev,
+      option_id: String(option_id),
+      updated_at: nowIso(),
+      // Keep original created_at, weight, stamp_hash, issued_weight_used intact (Option A snapshot semantics)
+      meta: req.body?.meta || prev.meta || {},
+    });
+
+    db.events.push({ kind: "vote_recast", poll_id: pollId, at: nowIso() });
+    saveDB(db);
+
+    const results = getAuthoritativeResults(db, poll);
+    broadcast(pollId, "results", { poll_id: pollId, results });
+
+    return res.json({ ok: true, voter_token: token, results });
+  }
+
+  // ----------------------------
+  // FIRST-VOTE PATH (stamp required)
+  // ----------------------------
+
+  // ---- STAMP REQUIRED (MVP) ----
+  const presentedStamp = req.get(STAMP_HEADER); // "X-Stamp"
+  if (!presentedStamp) return res.status(401).json({ error: "missing X-Stamp" });
+
+  // Stamp must exist and must be ACTIVE (findStampByToken only returns ACTIVE).
+  const stampRec = findStampByToken(db, presentedStamp);
   if (!stampRec) return res.status(403).json({ error: "invalid X-Stamp" });
 
   // ---- WEIGHT VALIDATION (authoritative) ----
@@ -916,40 +974,46 @@ app.post("/api/polls/:id/vote", (req, res) => {
     return res.status(403).json({ error: "try voting again at a different time" });
   }
 
-  // Poll must exist
-  const poll = db.polls.find(p => p.id === pollId);
-  if (!poll) return res.status(404).json({ error: "poll not found" });
-
-  // Apply lifecycle on access
-  const life = applyLifecycle(poll, nowIso());
-  if (life.changed) saveDB(db);
-
-  if (!canVote(poll)) return res.status(400).json({ error: "poll is closed" });
-
   // One persona -> one vote per poll (revote replaces)
   const personaId = stampRec.persona_id;
   const personaUid = personaBallotUid(db, pollId, personaId);
 
-  const prev = db.votes.find(v => v.poll_id === pollId && (v.persona_ballot_uid === personaUid || v.voter_token === personaUid));
-  db.votes = db.votes.filter(v => !(v.poll_id === pollId && (v.persona_ballot_uid === personaUid || v.voter_token === personaUid)));
+  const prev = db.votes.find(v =>
+    v.poll_id === pollId &&
+    (v.persona_ballot_uid === personaUid || v.voter_token === personaUid)
+  );
 
+  // Remove prior vote record (replacement semantics)
+  db.votes = db.votes.filter(v =>
+    !(v.poll_id === pollId && (v.persona_ballot_uid === personaUid || v.voter_token === personaUid))
+  );
+
+  // Persist vote record with a non-reversible stamp reference
   db.votes.push({
     id: nanoid(12),
     poll_id: pollId,
     option_id: String(option_id),
 
     // Stored as voter_token for backward compatibility with existing API shape.
-    // Semantically this is the ballot_uid.
+    // Semantically this is the poll-scoped ballot uid.
     voter_token: personaUid,
     persona_ballot_uid: personaUid,
 
     // Authoritative stamp weight used for tally.
     weight,
 
+    // New: audit fields (non-reversible stamp reference + explicit weight snapshot used)
+    stamp_hash: String(stampRec.token_hash || ""),      // already sha256(raw_stamp_token)
+    issued_weight_used: weight,
+
     created_at: prev ? prev.created_at : nowIso(),
     updated_at: prev ? nowIso() : null,
     meta: req.body?.meta || {},
   });
+
+  // Consume the stamp now that it has successfully cast a vote.
+  // This is what fixes pool_max=1 deadlocks (ACTIVE stamps are what count).
+  consumeStampForVote(db, stampRec, pollId);
 
   db.events.push({ kind: "vote_cast", poll_id: pollId, at: nowIso() });
   saveDB(db);
@@ -957,7 +1021,8 @@ app.post("/api/polls/:id/vote", (req, res) => {
   const results = getAuthoritativeResults(db, poll);
   broadcast(pollId, "results", { poll_id: pollId, results });
 
-  res.json({ ok: true, voter_token: personaUid, results });
+  // Return the poll-scoped voter_token so client can revote without burning a new stamp.
+  return res.json({ ok: true, voter_token: personaUid, results });
 });
 
 // Legitimacy Snapshot at Close
@@ -1156,6 +1221,48 @@ function findOrCreatePersonaForIdentity(db, identityInternalId) {
   if (!persona.meta || typeof persona.meta !== "object") persona.meta = {};
   persona.meta.identity_internal_id = identityInternalId;
   return persona;
+}
+
+// ---- Stamp consumption on vote (capability lifecycle) ----
+// - It produces an audit trail (identity.ledger.json) without storing raw tokens
+function consumeStampForVote(db, stampRec, pollId) {
+  if (!db || !stampRec) return;
+
+  // Only ACTIVE stamps can be consumed. If it's already USED/EXPIRED/etc, do nothing.
+  if (stampRec.status !== "ACTIVE") return;
+
+  const at = nowIso();
+
+  // Transition: ACTIVE -> USED
+  stampRec.status = "USED";
+  stampRec.used_at = at;
+
+  // Keep existing housekeeping fields consistent
+  stampRec.last_used_at = at;
+  stampRec.use_count = (Number(stampRec.use_count) || 0) + 1;
+
+  // Exchange event log (private exchange file)
+  if (Array.isArray(db.events)) {
+    db.events.push({
+      kind: "stamp_used",
+      poll_id: String(pollId),
+      stamp_id: String(stampRec.id),
+      at,
+      reason: "vote",
+    });
+  }
+
+  // Identity ledger (append-only audit log)
+  // NOTE: This is operator-readable. We can include persona_id server-side for accountability.
+  appendIdentityLedgerEvent({
+    type: "STAMP_USED",
+    at,
+    poll_id: String(pollId),
+    stamp_id: String(stampRec.id),
+    persona_id: String(stampRec.persona_id || ""),
+    stamp_hash_prefix: String(stampRec.token_hash || "").slice(0, 12),
+    reason: "vote",
+  });
 }
 
 // ---- Simple in-memory rate limit (resets on restart; good enough for MVP) ----
