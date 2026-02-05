@@ -7,6 +7,12 @@ services:
       - ./data:/app/data
     expose:
       - "8787"
-    # Optional: if you want to be explicit
     environment:
       - NODE_ENV=production
+    networks:
+      - caddy_net
+
+networks:
+  caddy_net:
+    external: true
+    name: bread-poll-mvp_default
