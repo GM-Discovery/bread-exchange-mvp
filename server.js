@@ -488,9 +488,6 @@ function clampEarnedPersonal(x) {
   if (!Number.isFinite(n)) return 0;
   return Math.max(0, Math.min(10, n));
 }
-function writeDelegations(d) {
-  writeJson(DELEGATION_DB_PATH, d);
-}
 
 // Helper: resolve delegator identity
 // - Normal: body.self_id
@@ -627,6 +624,11 @@ app.post("/api/delegation/revoke", (req, res) => {
 
   const delegatee = findIdentityByAlias(state, String(delegatee_alias));
   if (!delegatee) return res.status(404).json({ error: "delegatee_not_found" });
+
+  // Disallow self-delegation (delegator -> same identity)
+  if (delegatee && delegator && String(delegatee.internal_id) === String(delegator.internal_id)) {
+    return res.status(400).json({ error: "self_delegation_not_allowed" });
+  }
 
   const delegatorInternalId = String(delegator.internal_id);
   const delegateeInternalId = String(delegatee.internal_id);
