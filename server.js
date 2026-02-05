@@ -237,6 +237,7 @@ function issueOneStamp(db, personaId, options = {}) {
     issued_at: nowIso(),
     use_count: 0,
     last_used_at: null,
+    kind: options.kind === "DELEGATED" ? "DELEGATED" : "STANDARD",
     weight: typeof options.weight === "number" ? options.weight : 1.0,
     tags: Array.isArray(options.tags) ? options.tags : [],
     // Future fields: rotated_at, replaced_by, revoked_at, etc.
@@ -275,9 +276,11 @@ const LEGACY_DB_PATH = path.join(DATA_DIR, "db.json");
 const EXCHANGE_DB_PATH = path.join(DATA_DIR, "exchange.private.json"); // polls/votes/events
 const IDENTITY_DB_PATH = path.join(DATA_DIR, "identity.private.json"); // personas/stamps (+future)
 
-// NEW: identity layer stores (operator-readable state + append-only ledger)
+// Identity layer stores (operator-readable state + append-only ledger)
 const IDENTITY_STATE_PATH = path.join(DATA_DIR, "identity.state.json");
 const IDENTITY_LEDGER_PATH = path.join(DATA_DIR, "identity.ledger.json");
+// Delegation store (private; audit via identity ledger)
+const DELEGATION_DB_PATH = path.join(DATA_DIR, "delegation.private.json");
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
@@ -408,6 +411,390 @@ function broadcast(pollId, event, data) {
     } catch (_) {}
   }
 }
+
+// Delegation API v0 (minimal)
+// Helper: operator override (optional). If OPERATOR_KEY is not set, operator mode is disabled.
+function isOperator(req) {
+  const operatorKey = process.env.OPERATOR_KEY;
+  if (!operatorKey) return false;
+  const presented = req.get("X-Operator-Key");
+  return presented === operatorKey;
+}
+
+
+// IDENTITY LAYER v0 — helpers (backend-only)
+// Semantics lock:
+// - Votes use stampRec.weight ONLY (stamp is authoritative audit artifact).
+// - Identity is consulted ONLY at stamp issuance time to SET stamp weight.
+// - self_id is a *private stable secret* held by the user (stored hashed at rest).
+// - public_alias is a rotatable *public handle* (not a secret).
+// - internal_id is server-only and never exposed.
+
+// ---- Identity State + Ledger IO ----
+function readIdentityState() {
+  // State is a cache for fast reads; ledger is the audit source of truth.
+  // We keep state consistent by always writing state + ledger in the same request.
+  return readJsonOrInit(IDENTITY_STATE_PATH, {
+    identities: [],
+    aliases: {},     // public_alias -> internal_id
+    // Optional, helps fast lookup without scanning arrays:
+    self_index: {},  // self_id_hash -> internal_id
+  });
+}
+
+function writeIdentityState(state) {
+  writeJson(IDENTITY_STATE_PATH, state);
+}
+
+function readIdentityLedger() {
+  return readJsonOrInit(IDENTITY_LEDGER_PATH, { events: [] });
+}
+
+function appendIdentityLedgerEvent(evt) {
+  const ledger = readIdentityLedger();
+  if (!Array.isArray(ledger.events)) ledger.events = [];
+  ledger.events.push(evt);
+  writeJson(IDENTITY_LEDGER_PATH, ledger);
+}
+
+// ---- Lookup helpers ----
+function findIdentityBySelfIdHash(state, selfIdHash) {
+  const internalId = state?.self_index?.[selfIdHash];
+  if (!internalId) return null;
+  return (state.identities || []).find(x => x && x.internal_id === internalId) || null;
+}
+
+function findIdentityByAlias(state, alias) {
+  const internalId = state?.aliases?.[String(alias || "")];
+  if (!internalId) return null;
+  return (state.identities || []).find(x => x && x.internal_id === internalId) || null;
+}
+
+function findIdentityByInternalId(state, internalId) {
+  // Helper for internal-only lookups (server-only stable id).
+  if (!internalId) return null;
+  return (state.identities || []).find(x => x && x.internal_id === String(internalId)) || null;
+}
+
+// ---- Self-ID hashing (store only hashes at rest) ----
+function hashSelfId(selfIdRaw) {
+  // IMPORTANT: never store plaintext self_id.
+  return crypto.createHash("sha256").update(String(selfIdRaw), "utf8").digest("hex");
+}
+
+function clampEarnedPersonal(x) {
+  // Earned/personal points are capped at 10 by your rule.
+  const n = Number(x);
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0, Math.min(10, n));
+}
+function writeDelegations(d) {
+  writeJson(DELEGATION_DB_PATH, d);
+}
+
+// Helper: resolve delegator identity
+// - Normal: body.self_id
+// - Operator: body.delegator_alias (only if OPERATOR_KEY is enabled)
+function resolveDelegatorIdentity(state, req, res) {
+  if (isOperator(req)) {
+    const delegator_alias = req.body?.delegator_alias;
+    if (!delegator_alias) {
+      res.status(400).json({ error: "missing delegator_alias for operator call" });
+      return null;
+    }
+    const delegator = findIdentityByAlias(state, String(delegator_alias));
+    if (!delegator) {
+      res.status(404).json({ error: "delegator_not_found" });
+      return null;
+    }
+    return { delegator, by: "operator" };
+  }
+
+  const self_id = req.body?.self_id;
+  if (!self_id) {
+    res.status(401).json({ error: "missing self_id" });
+    return null;
+  }
+
+  const selfHash = hashSelfId(String(self_id));
+  const delegator = findIdentityBySelfIdHash(state, selfHash);
+  if (!delegator) {
+    res.status(404).json({ error: "delegator_not_found" });
+    return null;
+  }
+  return { delegator, by: "self" };
+}
+
+// ---- Delegation Store IO (private) ----
+function readDelegations() {
+  return readJsonOrInit(DELEGATION_DB_PATH, { delegations: [] });
+}
+
+// ---- Weight math (v0: delegations deferred) ----
+// - earned/personal points capped at 10
+// For now we return 0 delegated weight until the delegation kernel lands.
+function sumActiveDelegationsOut(delegatorInternalId) {
+  const d = readDelegations();
+  const rows = Array.isArray(d.delegations) ? d.delegations : [];
+  let sum = 0;
+
+  for (const r of rows) {
+    if (!r) continue;
+    if (r.status !== "ACTIVE") continue;
+    if (r.delegator_internal_id !== delegatorInternalId) continue;
+    const amt = Number(r.amount);
+    if (!Number.isFinite(amt) || amt <= 0) continue;
+    sum += amt;
+  }
+  return sum;
+}
+
+function sumActiveDelegationsIn(delegateeInternalId) {
+  const d = readDelegations();
+  const rows = Array.isArray(d.delegations) ? d.delegations : [];
+  let sum = 0;
+
+  for (const r of rows) {
+    if (!r) continue;
+    if (r.status !== "ACTIVE") continue;
+    if (r.delegatee_internal_id !== delegateeInternalId) continue;
+    const amt = Number(r.amount);
+    if (!Number.isFinite(amt) || amt <= 0) continue;
+    sum += amt;
+  }
+  return sum;
+}
+
+// v0 semantics: inbound delegations are aggregated at issuance time
+function computeDelegatedInWeight(state, internalId) {
+  // state is present for future expansions; v0 reads the delegation store directly.
+  return sumActiveDelegationsIn(String(internalId || ""));
+}
+
+// Write delegation store
+function writeDelegations(d) {
+  writeJson(DELEGATION_DB_PATH, d);
+}
+
+// Sum ACTIVE outbound delegations for a delegator
+function sumActiveDelegationsOut(delegatorInternalId) {
+  const d = readDelegations();
+  const rows = Array.isArray(d.delegations) ? d.delegations : [];
+  let sum = 0;
+
+  for (const r of rows) {
+    if (!r) continue;
+    if (r.status !== "ACTIVE") continue;
+    if (r.delegator_internal_id !== delegatorInternalId) continue;
+    const amt = Number(r.amount);
+    if (!Number.isFinite(amt) || amt <= 0) continue;
+    sum += amt;
+  }
+  return sum;
+}
+
+// Sum ACTIVE inbound delegations for a delegatee
+function sumActiveDelegationsIn(delegateeInternalId) {
+  const d = readDelegations();
+  const rows = Array.isArray(d.delegations) ? d.delegations : [];
+  let sum = 0;
+
+  for (const r of rows) {
+    if (!r) continue;
+    if (r.status !== "ACTIVE") continue;
+    if (r.delegatee_internal_id !== delegateeInternalId) continue;
+    const amt = Number(r.amount);
+    if (!Number.isFinite(amt) || amt <= 0) continue;
+    sum += amt;
+  }
+  return sum;
+}
+
+// POST /api/delegation/revoke
+// Body:
+//   - self_id (delegator) OR (operator) delegator_alias
+//   - delegatee_alias
+app.post("/api/delegation/revoke", (req, res) => {
+  const { delegatee_alias } = req.body || {};
+  if (!delegatee_alias) return res.status(400).json({ error: "delegatee_alias is required" });
+
+  const state = readIdentityState();
+  const resolved = resolveDelegatorIdentity(state, req, res);
+  if (!resolved) return;
+
+  const delegator = resolved.delegator;
+  const by = resolved.by;
+
+  const delegatee = findIdentityByAlias(state, String(delegatee_alias));
+  if (!delegatee) return res.status(404).json({ error: "delegatee_not_found" });
+
+  const delegatorInternalId = String(delegator.internal_id);
+  const delegateeInternalId = String(delegatee.internal_id);
+
+  const d = readDelegations();
+  if (!Array.isArray(d.delegations)) d.delegations = [];
+
+  const edge = d.delegations.find(r =>
+    r &&
+    r.delegator_internal_id === delegatorInternalId &&
+    r.delegatee_internal_id === delegateeInternalId &&
+    r.status === "ACTIVE"
+  );
+
+  if (!edge) return res.json({ ok: true }); // idempotent
+
+  const now = nowIso();
+  const prior = edge.amount;
+
+  edge.status = "REVOKED";
+  edge.updated_at = now;
+
+  writeDelegations(d);
+
+  appendIdentityLedgerEvent({
+    id: "evt_" + nanoid(12),
+    ts: now,
+    type: "DELEGATION_REVOKED",
+    delegator_internal_id: delegatorInternalId,
+    delegatee_internal_id: delegateeInternalId,
+    prior_amount: prior,
+    meta: { by },
+  });
+
+  return res.json({ ok: true });
+});
+
+// POST /api/delegation/set
+// Body:
+//   - self_id (delegator) OR (operator) delegator_alias
+//   - delegatee_alias
+//   - amount (integer; 0 revokes)
+app.post("/api/delegation/set", (req, res) => {
+  const { delegatee_alias, amount } = req.body || {};
+  if (!delegatee_alias || amount === undefined) {
+    return res.status(400).json({ error: "delegatee_alias and amount are required" });
+  }
+
+  const amt = Number(amount);
+  if (!Number.isInteger(amt) || amt < 0) {
+    return res.status(400).json({ error: "amount must be an integer >= 0" });
+  }
+
+  const state = readIdentityState();
+  const resolved = resolveDelegatorIdentity(state, req, res);
+  if (!resolved) return;
+
+  const delegator = resolved.delegator;
+  const by = resolved.by;
+
+  const delegatee = findIdentityByAlias(state, String(delegatee_alias));
+  if (!delegatee) return res.status(404).json({ error: "delegatee_not_found" });
+
+  const delegatorInternalId = String(delegator.internal_id);
+  const delegateeInternalId = String(delegatee.internal_id);
+
+  const d = readDelegations();
+  if (!Array.isArray(d.delegations)) d.delegations = [];
+
+  // Find existing edge (one per pair)
+  let edge = d.delegations.find(r =>
+    r &&
+    r.delegator_internal_id === delegatorInternalId &&
+    r.delegatee_internal_id === delegateeInternalId
+  );
+
+  const now = nowIso();
+
+  // amount=0 => revoke (audit-friendly)
+  if (amt === 0) {
+    if (edge && edge.status === "ACTIVE") {
+      const prior = edge.amount;
+      edge.status = "REVOKED";
+      edge.updated_at = now;
+
+      writeDelegations(d);
+
+      appendIdentityLedgerEvent({
+        id: "evt_" + nanoid(12),
+        ts: now,
+        type: "DELEGATION_REVOKED",
+        delegator_internal_id: delegatorInternalId,
+        delegatee_internal_id: delegateeInternalId,
+        prior_amount: prior,
+        meta: { by },
+      });
+    }
+
+    const W = clampEarnedPersonal(delegator.earned_personal ?? 0);
+    const outSumNow = sumActiveDelegationsOut(delegatorInternalId);
+    return res.json({
+      ok: true,
+      delegated_out_sum: outSumNow,
+      delegator_available_weight: Math.max(0, W - outSumNow),
+    });
+  }
+
+  // Budget enforcement: sum(out) <= current earned_personal
+  const W = clampEarnedPersonal(delegator.earned_personal ?? 0);
+
+  // Compute current out sum excluding this edge (if updating)
+  let outSum = 0;
+  for (const r of d.delegations) {
+    if (!r || r.status !== "ACTIVE") continue;
+    if (r.delegator_internal_id !== delegatorInternalId) continue;
+    if (edge && r === edge) continue;
+    const a = Number(r.amount);
+    if (!Number.isFinite(a) || a <= 0) continue;
+    outSum += a;
+  }
+
+  if ((outSum + amt) > W) {
+    return res.status(400).json({
+      error: "delegation_budget_exceeded",
+      weight: W,
+      delegated_out_sum: outSum,
+      attempted_amount: amt,
+    });
+  }
+
+  // Upsert ACTIVE edge
+  if (!edge) {
+    edge = {
+      id: "del_" + nanoid(12),
+      delegator_internal_id: delegatorInternalId,
+      delegatee_internal_id: delegateeInternalId,
+      amount: amt,
+      status: "ACTIVE",
+      created_at: now,
+      updated_at: now,
+    };
+    d.delegations.push(edge);
+  } else {
+    edge.amount = amt;
+    edge.status = "ACTIVE";
+    edge.updated_at = now;
+  }
+
+  writeDelegations(d);
+
+  appendIdentityLedgerEvent({
+    id: "evt_" + nanoid(12),
+    ts: now,
+    type: "DELEGATION_SET",
+    delegator_internal_id: delegatorInternalId,
+    delegatee_internal_id: delegateeInternalId,
+    amount: amt,
+    meta: { by },
+  });
+
+  const outSumNow = sumActiveDelegationsOut(delegatorInternalId);
+
+  return res.json({
+    ok: true,
+    delegated_out_sum: outSumNow,
+    delegator_available_weight: Math.max(0, W - outSumNow),
+  });
+});
 
 // ---- Static frontend ----
 app.use(express.static(path.join(__dirname, "public")));
@@ -556,7 +943,7 @@ app.post("/api/identity/create", (req, res) => {
     ts: now,
     type: "IDENTITY_CREATED",
     internal_id,
-    delta_weight: delta,
+    delta_weight: 1,
     meta: { by: "system", ip },
   });
 
@@ -620,6 +1007,32 @@ app.post("/api/identity/grant-trust", (req, res) => {
   return res.json({ ok: true, new_earned_personal: after });
 });
 
+// DELEGATION API v0
+//
+// Auth: either
+// - operator header X-Operator-Key (if OPERATOR_KEY is set), OR
+// - self_id in body (delegator proves stable identity)
+//
+// Body uses self_id + delegatee_alias per kernel.
+
+function isOperator(req) {
+  const operatorKey = process.env.OPERATOR_KEY;
+  if (!operatorKey) return false;
+  const presented = req.get("X-Operator-Key");
+  return presented === operatorKey;
+}
+
+function requireSelfOrOperator(req, res) {
+  if (isOperator(req)) return { ok: true, by: "operator" };
+
+  const self_id = req.body?.self_id;
+  if (!self_id) {
+    res.status(401).json({ error: "missing self_id" });
+    return null;
+  }
+  return { ok: true, by: "self", self_id: String(self_id) };
+}
+
 app.post("/api/stamp", (req, res) => {
   const db = loadDB();
 
@@ -630,10 +1043,10 @@ app.post("/api/stamp", (req, res) => {
     if (stampRec) personaId = stampRec.persona_id;
   }
 
-// ---- STAMP ISSUANCE ----
-// Uses existing Caddy Basic Auth gate (treat as a "write").
-// - If client provides a valid X-Stamp -> resolve persona, top up if below target
-// - If no/invalid stamp -> create new persona, issue target stamps
+  // ---- STAMP ISSUANCE ----
+  // Uses existing Caddy Basic Auth gate (treat as a "write").
+  // - If client provides a valid X-Stamp -> resolve persona, top up if below target
+  // - If no/invalid stamp -> create new persona, issue target stamps
 if (!personaId) {
   // Optional identity proof:
   // - If X-Self-ID is present and valid, we mint a stamp whose weight is derived from identity.
@@ -641,6 +1054,8 @@ if (!personaId) {
   const selfIdRaw = req.get(SELF_ID_HEADER); // "X-Self-ID" (private secret)
   let issuedWeight = 1.0;                   // anonymous default
   let issuedTags = [];                      // snapshot tags written onto stamps
+  let standardWeight = 0.0;
+  let delegatedWeight = 0.0;
 
   if (selfIdRaw) {
     const state = readIdentityState();
@@ -658,8 +1073,14 @@ if (!personaId) {
     personaId = persona.id;
 
     // Snapshot weight for this stamp issuance.
-    issuedWeight = computeStampSnapshotWeightFromIdentity(state, identity);
-      if (Array.isArray(identity.tags)) issuedTags = identity.tags.slice(0, 50);
+    standardWeight = computeStandardSnapshotWeightFromIdentity(state, identity);
+    delegatedWeight = computeDelegatedSnapshotWeightFromIdentity(state, identity);
+
+    // We still snapshot tags the same way
+    if (Array.isArray(identity.tags)) issuedTags = identity.tags.slice(0, 50);
+
+    // Issue stamps with explicit kinds below.
+    issuedWeight = null; // keep variable but mark unused in this branch
   } else {
     // Anonymous persona (no recovery model)
     const persona = createPersona(db);
@@ -677,10 +1098,39 @@ if (!personaId) {
   const need = Math.max(0, desired - active);
   const toIssue = Math.min(room, need);
 
-  for (let i = 0; i < toIssue; i++) {
-    // Stamp remains authoritative: snapshot weight/tags on the stamp record now.
-    issued.push(issueOneStamp(db, personaId, { weight: issuedWeight, tags: issuedTags }));
+  // v0 rule: if we have both weights > 0 and room for 2+, try to mint at least 1 of each.
+  let wantStandard = (typeof standardWeight === "number" && standardWeight > 0);
+  let wantDelegated = (typeof delegatedWeight === "number" && delegatedWeight > 0);
+
+  let nStandard = 0;
+  let nDelegated = 0;
+
+  if (wantStandard && wantDelegated) {
+    if (toIssue >= 2) {
+      nStandard = 1;
+      nDelegated = 1;
+      // any remaining slots: bias to STANDARD (so sovereign voice is never starved)
+      const remainingSlots = toIssue - 2;
+      nStandard += remainingSlots;
+    } else if (toIssue === 1) {
+      nStandard = 1;
+    }
+  } else if (wantStandard) {
+    nStandard = toIssue;
+  } else if (wantDelegated) {
+    nDelegated = toIssue;
   }
+
+  // Mint STANDARD
+  for (let i = 0; i < nStandard; i++) {
+    issued.push(issueOneStamp(db, personaId, { weight: standardWeight, tags: issuedTags, kind: "STANDARD" }));
+  }
+
+  // Mint DELEGATED
+  for (let i = 0; i < nDelegated; i++) {
+    issued.push(issueOneStamp(db, personaId, { weight: delegatedWeight, tags: issuedTags, kind: "DELEGATED" }));
+  }
+
 
   if (issued.length > 0) {
     db.events.push({
@@ -689,7 +1139,7 @@ if (!personaId) {
       at: nowIso(),
       count: issued.length,
       note: selfIdRaw ? "identity_weighted" : "anonymous",
-      weight: issuedWeight,
+      weights: { standard: standardWeight ?? null, delegated: delegatedWeight ?? null },
     });
   }
 
@@ -698,7 +1148,8 @@ if (!personaId) {
   return res.json({
     ok: true,
     issued,
-    issued_weight: issued.length > 0 ? issuedWeight : null,
+    issued_weight: null, // legacy single-field; identity issuance may mint multiple kinds
+    issued_weights: { standard: standardWeight ?? null, delegated: delegatedWeight ?? null },
     issued_tags: issued.length > 0 ? issuedTags : null,
     active_count: countActiveStamps(db, personaId),
     target: STAMP_POOL_TARGET,
@@ -728,18 +1179,43 @@ if (!personaId) {
     const state = readIdentityState();
     const identity = findIdentityByInternalId(state, identityInternalId);
 
-    if (identity) {
-      topUpWeight = computeStampSnapshotWeightFromIdentity(state, identity);
+    let topUpStandardWeight = 1.0;
+    let topUpDelegatedWeight = 0.0;
 
-      // Tags are not secret; snapshot what’s on identity state at issuance.
+    if (identity) {
+      topUpStandardWeight = computeStandardSnapshotWeightFromIdentity(state, identity);
+      topUpDelegatedWeight = computeDelegatedSnapshotWeightFromIdentity(state, identity);
+
       if (Array.isArray(identity.tags)) topUpTags = identity.tags.slice(0, 50);
     }
+
+  const wantStandard = Number.isFinite(topUpStandardWeight) && topUpStandardWeight > 0;
+  const wantDelegated = Number.isFinite(topUpDelegatedWeight) && topUpDelegatedWeight > 0;
+
+  let nStandard = 0;
+  let nDelegated = 0;
+
+  if (wantStandard && wantDelegated) {
+    if (toIssue >= 2) {
+      nStandard = 1;
+      nDelegated = 1;
+      nStandard += (toIssue - 2);
+    } else if (toIssue === 1) {
+      nStandard = 1;
+    }
+  } else if (wantStandard) {
+    nStandard = toIssue;
+  } else if (wantDelegated) {
+    nDelegated = toIssue;
   }
 
-  for (let i = 0; i < toIssue; i++) {
-    // Stamp remains authoritative: write snapshot weight/tags onto stamp record.
-    issued.push(issueOneStamp(db, personaId, { weight: topUpWeight, tags: topUpTags }));
+  for (let i = 0; i < nStandard; i++) {
+    issued.push(issueOneStamp(db, personaId, { weight: topUpStandardWeight, tags: topUpTags, kind: "STANDARD" }));
   }
+  for (let i = 0; i < nDelegated; i++) {
+    issued.push(issueOneStamp(db, personaId, { weight: topUpDelegatedWeight, tags: topUpTags, kind: "DELEGATED" }));
+  }
+
 
   if (issued.length > 0) {
     db.events.push({ kind: "stamp_topped_up", persona_id: personaId, at: nowIso(), count: issued.length });
@@ -750,13 +1226,14 @@ if (!personaId) {
   return res.json({
     ok: true,
     issued,                // empty array means "you already have enough"
-    issued_weight: issued.length > 0 ? topUpWeight : null,
+    issued_weight: null,
+    issued_weights: { standard: topUpStandardWeight ?? null, delegated: topUpDelegatedWeight ?? null },
     issued_tags: issued.length > 0 ? topUpTags : null,
     active_count: countActiveStamps(db, personaId),
     target: STAMP_POOL_TARGET,
     max: STAMP_POOL_MAX,
   });
-});
+};
 
 app.get("/api/polls", (req, res) => {
   const db = loadDB();
@@ -1117,97 +1594,20 @@ function computeResults(db, pollId) {
   };
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// IDENTITY LAYER v0 — helpers (backend-only)
-// Semantics lock:
-// - Votes use stampRec.weight ONLY (stamp is authoritative audit artifact).
-// - Identity is consulted ONLY at stamp issuance time to SET stamp weight.
-// - self_id is a *private stable secret* held by the user (stored hashed at rest).
-// - public_alias is a rotatable *public handle* (not a secret).
-// - internal_id is server-only and never exposed.
-////////////////////////////////////////////////////////////////////////////////
-
-// New stores (operator-readable, but still permissioned by ops practice)
-// NOTE: These constants are defined up top in the persistence section.
-// We reference them here via function hoisting / module scope:
-//   IDENTITY_STATE_PATH, IDENTITY_LEDGER_PATH
-
-// ---- Self-ID hashing (store only hashes at rest) ----
-function hashSelfId(selfIdRaw) {
-  // IMPORTANT: never store plaintext self_id.
-  return crypto.createHash("sha256").update(String(selfIdRaw), "utf8").digest("hex");
-}
-
-// ---- Identity State + Ledger IO ----
-function readIdentityState() {
-  // State is a cache for fast reads; ledger is the audit source of truth.
-  // We keep state consistent by always writing state + ledger in the same request.
-  return readJsonOrInit(IDENTITY_STATE_PATH, {
-    identities: [],
-    aliases: {},     // public_alias -> internal_id
-    // Optional, helps fast lookup without scanning arrays:
-    self_index: {},  // self_id_hash -> internal_id
-  });
-}
-
-function writeIdentityState(state) {
-  writeJson(IDENTITY_STATE_PATH, state);
-}
-
-function readIdentityLedger() {
-  return readJsonOrInit(IDENTITY_LEDGER_PATH, { events: [] });
-}
-
-function appendIdentityLedgerEvent(evt) {
-  const ledger = readIdentityLedger();
-  if (!Array.isArray(ledger.events)) ledger.events = [];
-  ledger.events.push(evt);
-  writeJson(IDENTITY_LEDGER_PATH, ledger);
-}
-
-// ---- Lookup helpers ----
-function findIdentityBySelfIdHash(state, selfIdHash) {
-  const internalId = state?.self_index?.[selfIdHash];
-  if (!internalId) return null;
-  return (state.identities || []).find(x => x && x.internal_id === internalId) || null;
-}
-
-function findIdentityByAlias(state, alias) {
-  const internalId = state?.aliases?.[String(alias || "")];
-  if (!internalId) return null;
-  return (state.identities || []).find(x => x && x.internal_id === internalId) || null;
-}
-
-function findIdentityByInternalId(state, internalId) {
-  // Helper for internal-only lookups (server-only stable id).
-  if (!internalId) return null;
-  return (state.identities || []).find(x => x && x.internal_id === String(internalId)) || null;
-}
-
-// ---- Weight math (v0: delegations deferred) ----
-// - earned/personal points capped at 10
-// For now we return 0 delegated weight until the delegation kernel lands.
-function computeDelegatedInWeight_v0_unused(/* state, internalId */) {
-  return 0;
-}
-
-function clampEarnedPersonal(x) {
-  // Earned/personal points are capped at 10 by your rule.
-  const n = Number(x);
-  if (!Number.isFinite(n)) return 0;
-  return Math.max(0, Math.min(10, n));
-}
-
-function computeStampSnapshotWeightFromIdentity(state, identityRec) {
-  // IMPORTANT: stamp remains authoritative, so this is a snapshot at issuance.
+// IMPORTANT: stamp remains authoritative, so this is a snapshot at issuance.
   // - Identity-based stamps must not mint with weight < 1.
+function computeStandardSnapshotWeightFromIdentity(state, identityRec) {
+  // Standard weight is what the identity can personally spend after delegating out.
   const earned = clampEarnedPersonal(identityRec?.earned_personal ?? identityRec?.weight ?? 0);
-  const delegated = computeDelegatedInWeight_v0_unused(state, identityRec?.internal_id);
-  const total = earned + delegated;
+  const out = sumActiveDelegationsOut(String(identityRec?.internal_id || ""));
+  const remaining = earned - out;
 
-  // High precision allowed; we store the numeric result on the stamp record.
-  const raw = Number(total) || 0;
-  return Math.max(1, raw);
+  return Math.max(0, Number(remaining) || 0);
+}
+
+function computeDelegatedSnapshotWeightFromIdentity(state, identityRec) {
+  const inbound = computeDelegatedInWeight(state, identityRec?.internal_id);
+  return Math.max(0, Number(inbound) || 0);
 }
 
 // ---- Persona binding (identity -> persona is internal only) ----
@@ -1264,6 +1664,7 @@ function consumeStampForVote(db, stampRec, pollId) {
     reason: "vote",
   });
 }
+});
 
 // ---- Simple in-memory rate limit (resets on restart; good enough for MVP) ----
 const _rl = new Map(); // key -> { count, resetAtMs }
