@@ -9,7 +9,7 @@
  *
  * - Persistence: JSON file on disk (data/db.json)
  * - Notes:
- *   This is a deliberately small, non-magical baseline that you can extend into the full Exchange.
+ *   
  */
 
 const express = require("express");
@@ -229,6 +229,10 @@ function createPersona(db) {
 function issueOneStamp(db, personaId, options = {}) {
   const token = generateStampToken();
 
+  // Never mint unusable stamps (vote path rejects weight < 1).
+  const w = Number(options.weight);
+  if (!Number.isFinite(w) || w < 1) return null;
+
   const rec = {
     id: "st_" + nanoid(12),
     persona_id: personaId,
@@ -237,8 +241,13 @@ function issueOneStamp(db, personaId, options = {}) {
     issued_at: nowIso(),
     use_count: 0,
     last_used_at: null,
-    kind: options.kind === "DELEGATED" ? "DELEGATED" : "STANDARD",
-    weight: typeof options.weight === "number" ? options.weight : 1.0,
+
+    // Preserve declared kind (STANDARD / DELEGATED / COMBINED). Default to STANDARD.
+    kind: (typeof options.kind === "string" && options.kind) ? options.kind : "STANDARD",
+
+    // Store the validated numeric weight.
+    weight: w,
+
     tags: Array.isArray(options.tags) ? options.tags : [],
     // Future fields: rotated_at, replaced_by, revoked_at, etc.
   };
@@ -692,6 +701,11 @@ app.post("/api/delegation/set", (req, res) => {
   const delegatee = findIdentityByAlias(state, String(delegatee_alias));
   if (!delegatee) return res.status(404).json({ error: "delegatee_not_found" });
 
+  // Disallow self-delegation (delegator and delegatee are the same identity)
+  if (delegatee && delegator && String(delegatee.internal_id) === String(delegator.internal_id)) {
+    return res.status(400).json({ error: "self_delegation_not_allowed" });
+  }
+
   const delegatorInternalId = String(delegator.internal_id);
   const delegateeInternalId = String(delegatee.internal_id);
 
@@ -736,7 +750,11 @@ app.post("/api/delegation/set", (req, res) => {
     });
   }
 
-  // Budget enforcement: sum(out) <= current earned_personal
+  // Budget enforcement (v0): STANDARD delegation only.
+  // - This route represents "I delegate some of MY standard points to an expert."
+  // - Budget is earned_personal only (NOT earned + inbound).
+  // TODO (Pass-through lifecycle): delegated/inbound pool should be routed via a separate
+  // PASS_THROUGH primitive (all-or-none), not by increasing the budget here.
   const W = clampEarnedPersonal(delegator.earned_personal ?? 0);
 
   // Compute current out sum excluding this edge (if updating)
@@ -753,7 +771,7 @@ app.post("/api/delegation/set", (req, res) => {
   if ((outSum + amt) > W) {
     return res.status(400).json({
       error: "delegation_budget_exceeded",
-      weight: W,
+      weight: W, // earned_personal budget (standard-only)
       delegated_out_sum: outSum,
       attempted_amount: amt,
     });
@@ -1115,7 +1133,10 @@ if (!personaId) {
       const remainingSlots = toIssue - 2;
       nStandard += remainingSlots;
     } else if (toIssue === 1) {
+      // Pool limit only allows one stamp.
+      // Mint COMBINED so delegated weight is not stranded.
       nStandard = 1;
+      nDelegated = 1;
     }
   } else if (wantStandard) {
     nStandard = toIssue;
@@ -1123,16 +1144,27 @@ if (!personaId) {
     nDelegated = toIssue;
   }
 
+  // If we would mint both kinds, mint one combined stamp instead.
+  // Reason: vote path spends a single stamp and uses stamp.weight (kind-agnostic).
+  if (nStandard > 0 && nDelegated > 0) {
+    const combined = Number(standardWeight) + Number(delegatedWeight);
+    const t = issueOneStamp(db, personaId, { weight: combined, tags: issuedTags, kind: "COMBINED" });
+    if (t) issued.push(t);
+    nStandard = 0;
+    nDelegated = 0;
+  }
+
   // Mint STANDARD
   for (let i = 0; i < nStandard; i++) {
-    issued.push(issueOneStamp(db, personaId, { weight: standardWeight, tags: issuedTags, kind: "STANDARD" }));
+    const t = issueOneStamp(db, personaId, { weight: standardWeight, tags: issuedTags, kind: "STANDARD" });
+    if (t) issued.push(t);
   }
 
   // Mint DELEGATED
   for (let i = 0; i < nDelegated; i++) {
-    issued.push(issueOneStamp(db, personaId, { weight: delegatedWeight, tags: issuedTags, kind: "DELEGATED" }));
+    const t = issueOneStamp(db, personaId, { weight: delegatedWeight, tags: issuedTags, kind: "DELEGATED" });
+    if (t) issued.push(t);
   }
-
 
   if (issued.length > 0) {
     db.events.push({
@@ -1149,9 +1181,16 @@ if (!personaId) {
 
   return res.json({
     ok: true,
-    issued,
-    issued_weight: null, // legacy single-field; identity issuance may mint multiple kinds
+    issued,                // empty array means "you already have enough"
+    issued_weight: null,
     issued_weights: { standard: standardWeight ?? null, delegated: delegatedWeight ?? null },
+
+    // Convenience: total weight implied by issued_weights (vote path uses stamp.weight only).
+    issued_weight_combined:
+      (Number.isFinite(Number(standardWeight)) && Number.isFinite(Number(delegatedWeight)))
+        ? (Number(standardWeight) + Number(delegatedWeight))
+        : null,
+
     issued_tags: issued.length > 0 ? issuedTags : null,
     active_count: countActiveStamps(db, personaId),
     target: STAMP_POOL_TARGET,
@@ -1203,7 +1242,10 @@ if (!personaId) {
       nDelegated = 1;
       nStandard += (toIssue - 2);
     } else if (toIssue === 1) {
+      // Pool limit only allows one stamp.
+      // Mint COMBINED so delegated weight is not stranded.
       nStandard = 1;
+      nDelegated = 1;
     }
   } else if (wantStandard) {
     nStandard = toIssue;
@@ -1211,12 +1253,25 @@ if (!personaId) {
     nDelegated = toIssue;
   }
 
+  // If we would mint both kinds, mint one combined stamp instead.
+  // Reason: vote path spends a single stamp and uses stamp.weight (kind-agnostic).
+  if (nStandard > 0 && nDelegated > 0) {
+    const combined = Number(topUpStandardWeight) + Number(topUpDelegatedWeight);
+    const t = issueOneStamp(db, personaId, { weight: combined, tags: topUpTags, kind: "COMBINED" });
+    if (t) issued.push(t);
+    nStandard = 0;
+    nDelegated = 0;
+  }
+
   for (let i = 0; i < nStandard; i++) {
-    issued.push(issueOneStamp(db, personaId, { weight: topUpStandardWeight, tags: topUpTags, kind: "STANDARD" }));
+    const t = issueOneStamp(db, personaId, { weight: topUpStandardWeight, tags: topUpTags, kind: "STANDARD" });
+    if (t) issued.push(t);
   }
   for (let i = 0; i < nDelegated; i++) {
-    issued.push(issueOneStamp(db, personaId, { weight: topUpDelegatedWeight, tags: topUpTags, kind: "DELEGATED" }));
+    const t = issueOneStamp(db, personaId, { weight: topUpDelegatedWeight, tags: topUpTags, kind: "DELEGATED" });
+    if (t) issued.push(t);
   }
+
 
 
   if (issued.length > 0) {
@@ -1227,10 +1282,17 @@ if (!personaId) {
 
   return res.json({
     ok: true,
-    issued,                // empty array means "you already have enough"
-    issued_weight: null,
-    issued_weights: { standard: topUpStandardWeight ?? null, delegated: topUpDelegatedWeight ?? null },
-    issued_tags: issued.length > 0 ? topUpTags : null,
+    issued,
+    issued_weight: null, // legacy single-field; identity issuance may mint multiple kinds
+    issued_weights: { standard: standardWeight ?? null, delegated: delegatedWeight ?? null },
+
+    // Total implied weight (standard + delegated). No behavior change; convenience for callers.
+    issued_weight_combined:
+      (Number.isFinite(Number(standardWeight)) && Number.isFinite(Number(delegatedWeight)))
+        ? (Number(standardWeight) + Number(delegatedWeight))
+        : null,
+
+    issued_tags: issued.length > 0 ? issuedTags : null,
     active_count: countActiveStamps(db, personaId),
     target: STAMP_POOL_TARGET,
     max: STAMP_POOL_MAX,
@@ -1599,17 +1661,28 @@ function computeResults(db, pollId) {
 // IMPORTANT: stamp remains authoritative, so this is a snapshot at issuance.
   // - Identity-based stamps must not mint with weight < 1.
 function computeStandardSnapshotWeightFromIdentity(state, identityRec) {
-  // Standard weight is what the identity can personally spend after delegating out.
+  // STANDARD remaining (what is still "mine") after outbound delegation.
+  // Important design choice (matches federation / pass-through intuition):
+  //   standard_remaining + delegated_remaining == max(0, earned + inbound - out)
+     const internalId = String(identityRec?.internal_id || "");
   const earned = clampEarnedPersonal(identityRec?.earned_personal ?? identityRec?.weight ?? 0);
-  const out = sumActiveDelegationsOut(String(identityRec?.internal_id || ""));
-  const remaining = earned - out;
+  const inbound = computeDelegatedInWeight(state, identityRec?.internal_id);
+  const out = sumActiveDelegationsOut(internalId);
 
-  return Math.max(0, Number(remaining) || 0);
+  const outBeyondInbound = Math.max(0, Number(out) - Number(inbound));
+  const standardRemaining = Number(earned) - outBeyondInbound;
+
+  return Math.max(0, Number(standardRemaining) || 0);
 }
 
 function computeDelegatedSnapshotWeightFromIdentity(state, identityRec) {
+   // DELEGATED remaining (represented pool still held) after outbound delegation.
+   // Delegated-first waterfall: outbound reduces delegated pool before touching standard.
   const inbound = computeDelegatedInWeight(state, identityRec?.internal_id);
-  return Math.max(0, Number(inbound) || 0);
+  const out = sumActiveDelegationsOut(String(identityRec?.internal_id || ""));
+
+  const delegatedRemaining = Number(inbound) - Number(out);
+  return Math.max(0, Number(delegatedRemaining) || 0);
 }
 
 // ---- Persona binding (identity -> persona is internal only) ----
@@ -1717,3 +1790,9 @@ const PORT = process.env.PORT || 8787;
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Bread Exchange MVP running on http://localhost:${PORT}`);
 });
+
+// TO DO
+// 1. Security and proxy backend fix
+// 2. Front End Persona, Weights, Delegation
+// 3. Front End Admin with button to assign weight with event.
+// 4. Back end Federation
