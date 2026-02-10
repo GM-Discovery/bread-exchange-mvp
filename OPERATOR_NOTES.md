@@ -263,6 +263,165 @@ Stamp rotation enforcement (config knob exists only)
 Only /data is mounted.
 All application code is baked into the image and requires a rebuild to change behavior.
 
+---
+
+## Security v0 — Signed Requests (HMAC) + Operator Key
+
+### Overview
+
+Basic Auth has been removed.
+
+Sensitive Exchange endpoints now require **HMAC-signed requests** tied to an identity’s
+private `signing_key`. Operator-grade actions additionally require an **operator key**
+provided via environment variable.
+
+This design enforces:
+- explicit authorization
+- replay protection
+- fail-closed behavior for operator power
+
+---
+
+### Identity Secrets
+
+Each identity has two secrets:
+
+- `self_id`
+  - Stable identity secret
+  - Used to identify *which* identity is making a request
+  - Sent via `X-Self-ID` header
+  - Stored server-side **hashed**
+
+- `signing_key`
+  - Private signing secret (HMAC)
+  - Generated at identity creation
+  - Returned **once**
+  - Used only to sign API requests
+  - Stored server-side in `data/identity.signing.private.json`
+  - Never returned again
+
+Loss of `signing_key` requires future recovery/rotation (not yet implemented).
+
+---
+
+### Signed Request Contract (HMAC)
+
+Protected endpoints require the following headers:
+
+X-Self-ID: <self_id>
+X-Timestamp: <unix milliseconds>
+X-Nonce: <random string>
+X-Signature: <hex HMAC-SHA256>
+
+
+#### Signature Base String
+
+
+
+METHOD
+PATH
+TIMESTAMP
+NONCE
+SHA256(body)
+
+
+Example:
+
+
+
+POST
+/api/stamp
+1707535000123
+ab12cd34ef56
+e3b0c44298fc1c149afbf4c8996fb924...
+
+
+HMAC key = `signing_key`
+
+---
+
+### Replay Defense
+
+- Timestamp must be within ±5 minutes of server time
+- Nonces are cached in memory with TTL
+- Reuse of the same `(self_id, nonce)` within the window is rejected
+
+Note: replay cache is per-process (single-node MVP).
+
+---
+
+### Protected Endpoints (v0)
+
+| Endpoint | Protection |
+|--------|------------|
+| `POST /api/stamp` | HMAC signature |
+| `POST /api/delegation/set` | HMAC signature |
+| `POST /api/delegation/revoke` | HMAC signature |
+| `POST /api/identity/grant-trust` | HMAC + Operator Key |
+
+Unsigned requests return:
+
+
+401 { "error": "missing_signature_headers" }
+
+
+---
+
+### Operator Key
+
+Operator power (e.g. trust grants) requires **both**:
+- valid HMAC signature
+- valid operator key
+
+The operator key is **not** stored in the repo.
+
+#### Setup
+
+1) Create `.env` in the exchange directory:
+
+```bash
+openssl rand -hex 32 | awk '{print "OPERATOR_KEY="$1}' > .env
+chmod 600 .env
+
+
+Ensure .env is git-ignored.
+
+docker-compose.yml must reference:
+
+environment:
+  - OPERATOR_KEY=${OPERATOR_KEY}
+
+Behavior
+
+OPERATOR_KEY missing:
+
+503 { "error": "operator_key_missing" }
+
+
+Wrong operator key:
+
+403 { "error": "bad_operator_key" }
+
+
+Correct operator key:
+
+200 OK
+
+
+This endpoint fails closed by design.
+
+Notes for Operators
+
+Do not commit operator keys
+
+Rotate operator keys by regenerating .env and recreating container
+
+Admin UI will later prompt for operator key locally (never sent to server except per request)
+
+Caddy Basic Auth is no longer used
+
+Caddyfile comments must use # (not //)
+
 Technical Stuff:
 
 root@The-Bread-Standard-First-Exchange:/opt/bread-poll-mvp# docker compose config | sed -n '/bread-exchange:/,/^[^ ]/p'

@@ -1,0 +1,347 @@
+# OPERATOR_NOTES.md
+Bread Exchange / Poll Stack — Operator & Maintainer Notes
+
+## 1) Scope and purpose
+
+This document describes how the Bread Exchange backend currently operates, how it is deployed, and how to safely rebuild, test, and reason about it.
+
+It is intended for operators and maintainers, not end users.
+
+The Exchange implements:
+
+- stamp-based, weighted voting
+- lifecycle-driven poll locking
+- authoritative, server-side tallies
+- file-based persistence for auditability
+- a centralized configuration system with safe introspection
+
+Frontend behavior is intentionally out of scope.
+
+---
+
+## 2) Repository, paths, and layout
+
+### Host paths
+- `/opt/bread-exchange-mvp/` — Exchange repository root
+- `/opt/bread-exchange-mvp/data/` — *Repo copies* (not authoritative at runtime unless mounted)
+
+### Container paths
+- `/app/` — application code (baked into image)
+- `/app/data/` — persistent JSON state (bind-mounted, authoritative at runtime)
+
+### Runtime data mount (authoritative)
+Common deployments mount a host directory into `/app/data` (example):
+- Host: `/root/bread-exchange-data/` → Container: `/app/data/`
+
+**Operational implication:** Always inspect the mounted host directory for the authoritative data, not the repo’s `data/` folder.
+
+### Key code files
+- `server.js` — core routing + authority logic
+- `lib/lifecycle.js` — poll lifecycle transitions (finalize/publish semantics)
+- `config.js` — centralized configuration defaults
+
+### Key runtime data files (in `/app/data/`)
+- `exchange.private.json` — polls, votes, snapshots
+- `identity.private.json` — personas, stamps
+- `identity.state.json` — identity current state (weights/tags/aliases)
+- `identity.ledger.json` — append-only identity events
+- `delegation.private.json` — delegation edges (if enabled)
+- `identity.signing.private.json` — signing keys store (security v0)
+
+---
+
+## 3) Deployment model (critical)
+
+Application code is baked into the Docker image.
+
+Only the data directory is bind-mounted.
+
+**Editing source files on the host does not affect the running Exchange until the image is rebuilt.**
+
+### Required command after any code change
+```bash
+docker compose up -d --build --force-recreate bread-exchange
+```
+
+Failure to rebuild is the most common operational error.
+
+---
+
+## 4) Request flow and authority boundaries
+
+### Public poll application
+browser  
+→ Caddy (`bread-poll-mvp-caddy-1`)  
+→ `poll.breadstandard.com`  
+- `/api/*` → Poll API (Python)
+- `/` → Web container (static UI)
+
+### Exchange API
+browser / CLI  
+→ Caddy  
+→ `exchange.breadstandard.com`  
+→ `bread-exchange:8787`  
+→ Express (`server.js`)  
+→ JSON persistence in `/app/data`
+
+A `401` from Caddy means the request never reached Express.
+
+---
+
+## 5) Voting model (authoritative behavior)
+
+- Votes must include a valid `X-Stamp` header (first vote).
+- Stamps carry a numeric weight.
+- Ballot identity is derived server-side; client-supplied identity is ignored.
+- Vote tallies sum weights, not counts.
+
+Results expose audit-oriented fields:
+- `people_voted`
+- `represented_people`
+- `weights_used { min, max, sum, count }`
+
+### Stamp lifecycle (current)
+- Stamps are **consumed** (marked `USED`) on first vote submission.
+- Revote is allowed via `X-Voter-Token` for *replacement-only* on the same poll.
+- Replaying the same `X-Stamp` after consumption is rejected.
+
+---
+
+## 6) Poll lifecycle and snapshots
+
+For LEGITIMACY / GOVERNANCE polls, the lifecycle is typically:
+
+`open → closed → cooldown → finalized → published`
+
+At finalization/publish:
+- results are snapshotted exactly once
+- `snapshot_results` are persisted to `exchange.private.json`
+- future reads return the snapshot
+- further voting attempts are rejected
+
+Lifecycle transitions are evaluated when routes are accessed (no cron job).
+
+---
+
+## 7) Configuration system
+
+Features:
+- centralized configuration in `config.js`
+- defaults preserve prior behavior
+- missing/invalid config falls back safely
+- deterministic fingerprint computed at startup
+- safe introspection endpoint: `GET /api/config`
+
+**Explicit exclusions:** secrets, credentials, salts, tokens, and keys are never exposed.
+
+---
+
+## 8) Operational commands
+
+### Rebuild Exchange (required after code changes)
+```bash
+docker compose up -d --build --force-recreate bread-exchange
+```
+
+### Restart without rebuild
+```bash
+docker compose restart bread-exchange
+```
+
+### Logs
+```bash
+docker logs bread-exchange --tail 200
+```
+
+### Exec into container
+```bash
+docker exec -it bread-exchange sh
+```
+
+### Health check (from inside container)
+```bash
+wget -qO- http://127.0.0.1:8787/api/health
+```
+
+---
+
+## 9) Common failure modes
+
+### Code changes have no effect
+Cause: image not rebuilt  
+Fix: rebuild with `--build --force-recreate`
+
+### Host inspected the wrong data directory
+Cause: repo `/opt/bread-exchange-mvp/data` != mounted `/app/data`  
+Fix: find the host path bound to `/app/data` via `docker inspect` or `docker compose config`
+
+### Replay / signature failures
+Cause: clock skew, missing forwarded headers, reused nonce  
+Fix: ensure time is correct, ensure Caddy passes headers, mint a fresh nonce
+
+---
+
+## 10) Explicit non-goals (deferred)
+
+- Frontend work (unless explicitly scoped)
+- Delegation decay scheduler
+- Federation peering
+- Merkle/ZK proofs
+
+---
+
+## 11) Critical operational reminder
+
+Only `/app/data` is mounted and authoritative.  
+All application code is baked into the image and requires a rebuild to change behavior.
+
+---
+
+# Security v0 — Signed Requests (HMAC) + Operator Key
+
+## Overview
+
+Caddy Basic Auth has been removed for Exchange write endpoints.
+
+Sensitive Exchange endpoints now require **HMAC-signed requests** tied to an identity’s private `signing_key`. Operator-grade actions additionally require an **operator key** provided via environment variable.
+
+This design enforces:
+- explicit authorization
+- replay protection
+- fail-closed behavior for operator power
+
+---
+
+## Identity secrets
+
+Each identity has two secrets:
+
+### `self_id`
+- stable identity secret
+- used to identify *which* identity is making a request
+- sent via `X-Self-ID` header
+- stored server-side
+
+### `signing_key`
+- private signing secret (HMAC)
+- generated at identity creation
+- returned **once**
+- stored server-side in `/app/data/identity.signing.private.json`
+- never returned again
+
+Loss of `signing_key` requires future recovery/rotation (not yet implemented).
+
+---
+
+## Signed request contract (HMAC)
+
+Protected endpoints require these headers:
+
+- `X-Self-ID: <self_id>`
+- `X-Timestamp: <unix milliseconds>`
+- `X-Nonce: <random string>`
+- `X-Signature: <hex HMAC-SHA256>`
+
+### Signature base string
+
+Concatenate with newline separators:
+
+```
+METHOD
+PATH
+TIMESTAMP
+NONCE
+SHA256(body)
+```
+
+Example:
+
+```
+POST
+/api/stamp
+1707535000123
+ab12cd34ef56
+e3b0c44298fc1c149afbf4c8996fb924...
+```
+
+HMAC key = `signing_key`.
+
+---
+
+## Replay defense
+
+- Timestamp must be within ±5 minutes of server time
+- Nonces are cached in memory with TTL
+- Reuse of the same `(self_id, nonce)` within the window is rejected
+
+Note: replay cache is per-process (single-node MVP).
+
+---
+
+## Protected endpoints (v0)
+
+| Endpoint | Protection |
+|---|---|
+| `POST /api/stamp` | HMAC signature |
+| `POST /api/delegation/set` | HMAC signature |
+| `POST /api/delegation/revoke` | HMAC signature |
+| `POST /api/identity/grant-trust` | HMAC + Operator Key |
+
+Unsigned requests return:
+
+```json
+{ "error": "missing_signature_headers" }
+```
+
+---
+
+## Operator key
+
+Operator power (e.g., trust grants) requires **both**:
+- valid HMAC signature
+- valid operator key
+
+### Setup
+
+1) Create `.env` in the exchange directory:
+```bash
+openssl rand -hex 32 | awk '{print "OPERATOR_KEY="$1}' > .env
+chmod 600 .env
+```
+
+2) Ensure `.env` is git-ignored.
+
+3) Ensure `docker-compose.yml` references:
+```yaml
+environment:
+  - OPERATOR_KEY=${OPERATOR_KEY}
+```
+
+### Behavior
+
+- `OPERATOR_KEY` missing:
+```json
+{ "error": "operator_key_missing" }
+```
+
+- Wrong operator key:
+```json
+{ "error": "bad_operator_key" }
+```
+
+- Correct operator key:
+- `200 OK`
+
+This endpoint fails closed by design.
+
+### Notes for operators
+- Do not commit operator keys.
+- Rotate operator keys by regenerating `.env` and recreating the container.
+- Future admin UI should prompt for operator key locally (never stored server-side).
+
+---
+
+## Caddyfile notes
+
+- Caddyfile comments must use `#` (not `//`).
+- Ensure Caddy forwards `X-Self-ID`, `X-Timestamp`, `X-Nonce`, `X-Signature`, and `X-Operator-Key` headers.

@@ -9,6 +9,7 @@ services:
       - "8787"
     environment:
       - NODE_ENV=production
+      - OPERATOR_KEY=${OPERATOR_KEY}
     networks:
       - caddy_net
 

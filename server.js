@@ -30,7 +30,8 @@ const crypto = require("crypto");
 
 // --- Persona-unique ballot UID (one persona -> one vote per poll) ---
 // This computes a stable, non-raw key for a (persona_id, poll_id) pair.
-function sha256Hex(s) {
+// Hash helper for string-based IDs (ballot IDs, salts, etc.)
+function sha256HexString(s) {
   return crypto.createHash("sha256").update(String(s), "utf8").digest("hex");
 }
 
@@ -45,10 +46,11 @@ function getBallotSalt(db) {
 
 function personaBallotUid(db, pollId, personaId) {
   const salt = getBallotSalt(db);
-  return sha256Hex(`${personaId}:${pollId}:${salt}`);
+  return sha256HexString(`${personaId}:${pollId}:${salt}`);
 }
 
 const app = express();
+app.set("trust proxy", 1);
 
 // CORS FIRST
 app.use(cors({
@@ -60,7 +62,13 @@ app.use(cors({
 app.options("*", cors());
 
 // THEN body parsing
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({
+  limit: "1mb",
+  // Capture the raw request body so HMAC signing can hash exact bytes.
+  verify: (req, res, buf) => {
+    req.rawBody = buf; // Buffer
+  },
+}));
 
 // Hash for Stamp Tokens
 function hashStampToken(token) {
@@ -109,6 +117,198 @@ function mergeConfig(base, override) {
     }
   }
   return out;
+}
+
+// ============================================================================
+// HMAC signed-request helpers (v0)
+// - Used later to protect sensitive endpoints
+// - Replay defense: timestamp window + nonce uniqueness per identity
+// ============================================================================
+
+const SIGN_SKEW_MS = 5 * 60 * 1000; // 5 minutes in milliseconds
+
+// In-memory replay cache:
+// Map<self_id_hash, Map<nonce, expiresAtMs>>
+const seenNoncesBySelf = new Map();
+
+function nowMs() {
+  return Date.now();
+}
+
+// Hash raw request bodies (Buffer or string)
+function sha256HexRaw(buf) {
+  return crypto.createHash("sha256").update(buf).digest("hex");
+}
+
+// Compute HMAC-SHA256 (hex) from a hex key + string data
+function hmacSha256Hex(keyHex, dataStr) {
+  const keyBuf = Buffer.from(String(keyHex || ""), "hex");
+  return crypto.createHmac("sha256", keyBuf).update(dataStr).digest("hex");
+}
+
+// Remove expired nonces so memory does not grow forever
+function cleanupNonceCache() {
+  const t = nowMs();
+  for (const [selfHash, nonceMap] of seenNoncesBySelf.entries()) {
+    for (const [nonce, expiresAt] of nonceMap.entries()) {
+      if (expiresAt <= t) nonceMap.delete(nonce);
+    }
+    if (nonceMap.size === 0) seenNoncesBySelf.delete(selfHash);
+  }
+}
+
+// Remember a nonce or reject if already seen
+function rememberNonceOrReject(selfHash, nonce, tsMs) {
+  cleanupNonceCache();
+
+  const expiresAt = tsMs + SIGN_SKEW_MS;
+  let nonceMap = seenNoncesBySelf.get(selfHash);
+  if (!nonceMap) {
+    nonceMap = new Map();
+    seenNoncesBySelf.set(selfHash, nonceMap);
+  }
+
+  if (nonceMap.has(nonce)) {
+    return { ok: false, reason: "replay" };
+  }
+
+  nonceMap.set(nonce, expiresAt);
+  return { ok: true };
+}
+
+// ============================================================================
+// Identity signing-key private store
+// - Separate from identity.state.json
+// - Keys are indexed by self_id_hash (never plaintext self_id)
+// ============================================================================
+
+function readSigningStore() {
+  try {
+    if (!fs.existsSync(IDENTITY_SIGNING_DB_PATH)) {
+      return { keys: {} };
+    }
+    return JSON.parse(fs.readFileSync(IDENTITY_SIGNING_DB_PATH, "utf8"));
+  } catch (e) {
+    console.error("Failed to read signing key store:", e);
+    return { keys: {} };
+  }
+}
+
+function writeSigningStore(db) {
+  fs.mkdirSync(path.dirname(IDENTITY_SIGNING_DB_PATH), { recursive: true });
+  fs.writeFileSync(
+    IDENTITY_SIGNING_DB_PATH,
+    JSON.stringify(db, null, 2),
+    "utf8"
+  );
+}
+
+// Save or replace signing key for an identity
+function upsertSigningKey(selfIdHash, internalId, signingKeyHex) {
+  const db = readSigningStore();
+  if (!db.keys) db.keys = {};
+
+  db.keys[selfIdHash] = {
+    internal_id: internalId,
+    signing_key: signingKeyHex,
+    created_at: new Date().toISOString(),
+  };
+
+  writeSigningStore(db);
+}
+
+// Look up signing key by self_id_hash
+function getSigningKeyBySelfHash(selfIdHash) {
+  const db = readSigningStore();
+  return db?.keys?.[selfIdHash]?.signing_key || null;
+}
+
+// ============================================================================
+// HMAC signature verification middleware
+// ============================================================================
+
+function requireSignature(req, res, next) {
+  try {
+    const selfId = req.get(SELF_ID_HEADER);
+    const sig = req.get("X-Signature");
+    const tsRaw = req.get("X-Timestamp");
+    const nonce = req.get("X-Nonce");
+
+    if (!selfId || !sig || !tsRaw || !nonce) {
+      return res.status(401).json({ error: "missing_signature_headers" });
+    }
+
+    const tsMs = Number(tsRaw);
+    if (!Number.isFinite(tsMs)) {
+      return res.status(401).json({ error: "invalid_timestamp" });
+    }
+
+    const now = nowMs();
+    if (Math.abs(now - tsMs) > SIGN_SKEW_MS) {
+      return res.status(401).json({ error: "timestamp_out_of_window" });
+    }
+
+    const selfIdHash = hashSelfId(selfId);
+    const signingKey = getSigningKeyBySelfHash(selfIdHash);
+    if (!signingKey) {
+      return res.status(403).json({ error: "unknown_identity" });
+    }
+
+    const replay = rememberNonceOrReject(selfIdHash, nonce, tsMs);
+    if (!replay.ok) {
+      return res.status(403).json({ error: "replay_detected" });
+    }
+
+    // Hash the raw request body exactly as received
+    const bodyHash = sha256HexRaw(req.rawBody || "");
+
+    // Use full URL including query string
+    const base = [
+      req.method.toUpperCase(),
+      req.originalUrl,
+      tsRaw,
+      nonce,
+      bodyHash,
+    ].join("\n");
+
+    const expected = hmacSha256Hex(signingKey, base);
+
+    if (expected !== String(sig)) {
+      return res.status(401).json({ error: "bad_signature" });
+    }
+
+    // Attach verified identity info for downstream handlers
+    req.auth = {
+      self_id: selfId,
+      self_id_hash: selfIdHash,
+    };
+
+    return next();
+  } catch (err) {
+    console.error("Signature verification error:", err);
+    return res.status(500).json({ error: "signature_verification_failed" });
+  }
+}
+
+// ============================================================================
+// Operator key middleware (fail-closed)
+// ============================================================================
+
+function requireOperatorKey(req, res, next) {
+  const expected = process.env.OPERATOR_KEY;
+
+  // FAIL-CLOSED: if missing, disable this endpoint entirely
+  if (!expected) {
+    console.error("[SECURITY] OPERATOR_KEY missing; /api/identity/grant-trust disabled (fail-closed).");
+    return res.status(503).json({ error: "operator_key_missing" });
+  }
+
+  const got = req.get("X-Operator-Key");
+  if (!got || String(got) !== String(expected)) {
+    return res.status(403).json({ error: "bad_operator_key" });
+  }
+
+  return next();
 }
 
 const cfg = loadConfig();
@@ -288,6 +488,7 @@ const IDENTITY_DB_PATH = path.join(DATA_DIR, "identity.private.json"); // person
 // Identity layer stores (operator-readable state + append-only ledger)
 const IDENTITY_STATE_PATH = path.join(DATA_DIR, "identity.state.json");
 const IDENTITY_LEDGER_PATH = path.join(DATA_DIR, "identity.ledger.json");
+const IDENTITY_SIGNING_DB_PATH = path.join(DATA_DIR, "identity.signing.private.json");
 // Delegation store (private; audit via identity ledger)
 const DELEGATION_DB_PATH = path.join(DATA_DIR, "delegation.private.json");
 
@@ -620,7 +821,7 @@ function sumActiveDelegationsIn(delegateeInternalId) {
 // Body:
 //   - self_id (delegator) OR (operator) delegator_alias
 //   - delegatee_alias
-app.post("/api/delegation/revoke", (req, res) => {
+app.post("/api/delegation/revoke", requireSignature, (req, res) => {
   const { delegatee_alias } = req.body || {};
   if (!delegatee_alias) return res.status(400).json({ error: "delegatee_alias is required" });
 
@@ -680,7 +881,7 @@ app.post("/api/delegation/revoke", (req, res) => {
 //   - self_id (delegator) OR (operator) delegator_alias
 //   - delegatee_alias
 //   - amount (integer; 0 revokes)
-app.post("/api/delegation/set", (req, res) => {
+app.post("/api/delegation/set", requireSignature, (req, res) => {
   const { delegatee_alias, amount } = req.body || {};
   if (!delegatee_alias || amount === undefined) {
     return res.status(400).json({ error: "delegatee_alias and amount are required" });
@@ -967,18 +1168,21 @@ app.post("/api/identity/create", (req, res) => {
     meta: { by: "system", ip },
   });
 
+  // Generate a signing key for HMAC request authentication.
+  // This is returned ONCE to the client and stored privately.
+  const signing_key = crypto.randomBytes(32).toString("hex");
+  upsertSigningKey(self_id_hash, internal_id, signing_key);
+
   // DO NOT return internal_id.
-  return res.json({ ok: true, self_id, public_alias });
+  return res.json({
+    ok: true,
+    self_id,
+    signing_key,
+    public_alias,
+  });
 });
 
-app.post("/api/identity/grant-trust", (req, res) => {
-  // v0 security:
-  // Require OPERATOR_KEY and require X-Operator-Key.
-  const operatorKey = process.env.OPERATOR_KEY;
-  if (operatorKey) {
-    const presented = req.get("X-Operator-Key");
-    if (presented !== operatorKey) return res.status(401).json({ error: "unauthorized" });
-  }
+app.post("/api/identity/grant-trust", requireSignature, requireOperatorKey, (req, res) => {
 
   // Expect an explicit personal weight change (earned trust)
   const { public_alias, weight_delta, reason } = req.body || {};
@@ -1053,7 +1257,7 @@ function requireSelfOrOperator(req, res) {
   return { ok: true, by: "self", self_id: String(self_id) };
 }
 
-app.post("/api/stamp", (req, res) => {
+app.post("/api/stamp", requireSignature, (req, res) => {
   const db = loadDB();
 
   let personaId = null;
@@ -1790,9 +1994,3 @@ const PORT = process.env.PORT || 8787;
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Bread Exchange MVP running on http://localhost:${PORT}`);
 });
-
-// TO DO
-// 1. Security and proxy backend fix
-// 2. Front End Persona, Weights, Delegation
-// 3. Front End Admin with button to assign weight with event.
-// 4. Back end Federation

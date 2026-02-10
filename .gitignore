@@ -10,3 +10,4 @@ backups/
 # backups
 *.bak
 *.bak.*
+.env
