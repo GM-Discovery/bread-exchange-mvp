@@ -358,25 +358,7 @@ const STAMP_POOL_TARGET = cfg.stamps.pool_target; // general average active sign
 const STAMP_POOL_MAX = cfg.stamps.pool_max; // max active signatures
 const STAMP_ROTATE_EVERY_USES = cfg.stamps.rotate_every_uses; // How many times a single stamp can be used on a vote
 
-// ---- Ballot token storage (per poll) ----
-function voterTokenKey(pollId) {
-  return `voter_token:${pollId}`;
-}
 
-function getVoterToken(pollId) {
-  return localStorage.getItem(voterTokenKey(pollId)) || "";
-}
-
-function setVoterToken(pollId, token) {
-  if (token) localStorage.setItem(voterTokenKey(pollId), token);
-}
-
-function clearVoterToken(pollId) {
-  localStorage.removeItem(voterTokenKey(pollId));
-}
-
-// ---- Ephemeral stamp (never persist) ----
-let EPHEMERAL_STAMP = "";
 
 /**
  * Ballot UID helpers
@@ -1201,6 +1183,13 @@ app.post("/api/identity/create", (req, res) => {
 });
 
 app.post("/api/identity/grant-trust", requireSignature, requireOperatorKey, (req, res) => {
+  // v0 security:
+  // Require OPERATOR_KEY and require X-Operator-Key.
+  const operatorKey = process.env.OPERATOR_KEY;
+  if (operatorKey) {
+    const presented = req.get("X-Operator-Key");
+    if (presented !== operatorKey) return res.status(401).json({ error: "unauthorized" });
+  }
 
   // Expect an explicit personal weight change (earned trust)
   const { public_alias, weight_delta, reason } = req.body || {};
@@ -1286,8 +1275,9 @@ app.post("/api/stamp", requireSignature, (req, res) => {
   }
 
   // ---- STAMP ISSUANCE ----
+  // Uses existing Caddy Basic Auth gate (treat as a "write").
   // - If client provides a valid X-Stamp -> resolve persona, top up if below target
-  // - If no/invalid stamp -> create new persona, issue target stamp(s) based on identity (if provided and valid) or anonymous (default)
+  // - If no/invalid stamp -> create new persona, issue target stamps
 if (!personaId) {
   // Optional identity proof:
   // - If X-Self-ID is present and valid, we mint a stamp whose weight is derived from identity.
@@ -1451,75 +1441,74 @@ if (!personaId) {
       if (Array.isArray(identity.tags)) topUpTags = identity.tags.slice(0, 50);
     }
 
-    const wantStandard = Number.isFinite(topUpStandardWeight) && topUpStandardWeight > 0;
-    const wantDelegated = Number.isFinite(topUpDelegatedWeight) && topUpDelegatedWeight > 0;
+  const wantStandard = Number.isFinite(topUpStandardWeight) && topUpStandardWeight > 0;
+  const wantDelegated = Number.isFinite(topUpDelegatedWeight) && topUpDelegatedWeight > 0;
 
-    let nStandard = 0;
-    let nDelegated = 0;
+  let nStandard = 0;
+  let nDelegated = 0;
 
-    if (wantStandard && wantDelegated) {
-      if (toIssue >= 2) {
-        nStandard = 1;
-        nDelegated = 1;
-        nStandard += (toIssue - 2);
-      } else if (toIssue === 1) {
-        // Pool limit only allows one stamp.
-        // Mint COMBINED so delegated weight is not stranded.
-        nStandard = 1;
-        nDelegated = 1;
-      }
-    } else if (wantStandard) {
-      nStandard = toIssue;
-    } else if (wantDelegated) {
-      nDelegated = toIssue;
+  if (wantStandard && wantDelegated) {
+    if (toIssue >= 2) {
+      nStandard = 1;
+      nDelegated = 1;
+      nStandard += (toIssue - 2);
+    } else if (toIssue === 1) {
+      // Pool limit only allows one stamp.
+      // Mint COMBINED so delegated weight is not stranded.
+      nStandard = 1;
+      nDelegated = 1;
     }
+  } else if (wantStandard) {
+    nStandard = toIssue;
+  } else if (wantDelegated) {
+    nDelegated = toIssue;
+  }
 
-    // If we would mint both kinds, mint one combined stamp instead.
-    // Reason: vote path spends a single stamp and uses stamp.weight (kind-agnostic).
-    if (nStandard > 0 && nDelegated > 0) {
-      const combined = Number(topUpStandardWeight) + Number(topUpDelegatedWeight);
-      const t = issueOneStamp(db, personaId, { weight: combined, tags: topUpTags, kind: "COMBINED" });
-      if (t) issued.push(t);
-      nStandard = 0;
-      nDelegated = 0;
-    }
+  // If we would mint both kinds, mint one combined stamp instead.
+  // Reason: vote path spends a single stamp and uses stamp.weight (kind-agnostic).
+  if (nStandard > 0 && nDelegated > 0) {
+    const combined = Number(topUpStandardWeight) + Number(topUpDelegatedWeight);
+    const t = issueOneStamp(db, personaId, { weight: combined, tags: topUpTags, kind: "COMBINED" });
+    if (t) issued.push(t);
+    nStandard = 0;
+    nDelegated = 0;
+  }
 
-    for (let i = 0; i < nStandard; i++) {
-      const t = issueOneStamp(db, personaId, { weight: topUpStandardWeight, tags: topUpTags, kind: "STANDARD" });
-      if (t) issued.push(t);
-    }
-    for (let i = 0; i < nDelegated; i++) {
-      const t = issueOneStamp(db, personaId, { weight: topUpDelegatedWeight, tags: topUpTags, kind: "DELEGATED" });
-      if (t) issued.push(t);
-    }
+  for (let i = 0; i < nStandard; i++) {
+    const t = issueOneStamp(db, personaId, { weight: topUpStandardWeight, tags: topUpTags, kind: "STANDARD" });
+    if (t) issued.push(t);
+  }
+  for (let i = 0; i < nDelegated; i++) {
+    const t = issueOneStamp(db, personaId, { weight: topUpDelegatedWeight, tags: topUpTags, kind: "DELEGATED" });
+    if (t) issued.push(t);
+  }
 
 
 
-    if (issued.length > 0) {
-      db.events.push({ kind: "stamp_topped_up", persona_id: personaId, at: nowIso(), count: issued.length });
-    }
+  if (issued.length > 0) {
+    db.events.push({ kind: "stamp_topped_up", persona_id: personaId, at: nowIso(), count: issued.length });
+  }
 
-    saveDB(db);
+  saveDB(db);
 
-    return res.json({
-      ok: true,
-      issued,
-      issued_weight: null,
-      issued_weights: { standard: topUpStandardWeight ?? null, delegated: topUpDelegatedWeight ?? null },
+  return res.json({
+    ok: true,
+    issued,
+    issued_weight: null, // legacy single-field; identity issuance may mint multiple kinds
+    issued_weights: { standard: standardWeight ?? null, delegated: delegatedWeight ?? null },
 
-      issued_weight_combined:
-        (Number.isFinite(Number(topUpStandardWeight)) && Number.isFinite(Number(topUpDelegatedWeight)))
-          ? (Number(topUpStandardWeight) + Number(topUpDelegatedWeight))
-          : null,
+    // Total implied weight (standard + delegated). No behavior change; convenience for callers.
+    issued_weight_combined:
+      (Number.isFinite(Number(standardWeight)) && Number.isFinite(Number(delegatedWeight)))
+        ? (Number(standardWeight) + Number(delegatedWeight))
+        : null,
 
-      issued_tags: issued.length > 0 ? topUpTags : null,
-
-      active_count: countActiveStamps(db, personaId),
-      target: STAMP_POOL_TARGET,
-      max: STAMP_POOL_MAX,
-    });
-  } // end if (identityInternalId)
-});
+    issued_tags: issued.length > 0 ? issuedTags : null,
+    active_count: countActiveStamps(db, personaId),
+    target: STAMP_POOL_TARGET,
+    max: STAMP_POOL_MAX,
+  });
+};
 
 app.get("/api/polls", (req, res) => {
   const db = loadDB();
@@ -1578,6 +1567,59 @@ app.get("/api/polls/:id/results", (req, res) => {
     weights_used: r.weights_used,
     validated: r.validated,
   });
+});
+
+
+// ---------------------------------------------------------------------------
+// My ballot (authoritative "what did I vote for?") — identity-only (HMAC)
+// ---------------------------------------------------------------------------
+// GET /api/polls/:id/my-ballot
+// - Requires HMAC (X-Self-ID, X-Timestamp, X-Nonce, X-Signature)
+// - Resolves identity -> persona internally (no client-supplied persona)
+// - Returns minimal shape for UI selection rehydration (no internal ids / tokens)
+app.get("/api/polls/:id/my-ballot", requireSignature, (req, res) => {
+  const pollId = String(req.params.id || "");
+  const db = loadDB();
+
+  const poll = db.polls.find(p => String(p?.id) === pollId);
+  if (!poll) return res.status(404).json({ error: "poll_not_found" });
+
+  const state = readIdentityState();
+  const selfHash = req.auth?.self_id_hash;
+  const ident = findIdentityBySelfIdHash(state, selfHash);
+
+  // If the identity exists but isn't present in state for any reason, fail like other signed endpoints.
+  if (!ident) return res.status(403).json({ error: "unknown_identity" });
+
+  // Resolve persona bound to this identity. (If missing, treat as no vote.)
+  const persona = (db.personas || []).find(p => p?.meta?.identity_internal_id === ident.internal_id);
+  if (!persona) return res.json({ ok: true, has_vote: false });
+
+  // Persona-scoped uniqueness key used by vote storage
+  const uid = personaBallotUid(db, pollId, persona.id);
+
+  const v = (db.votes || []).find(x =>
+    String(x?.poll_id) === pollId && String(x?.persona_ballot_uid || x?.voter_token || "") === uid
+  );
+
+  if (!v) return res.json({ ok: true, has_vote: false });
+
+  // Optional convenience: look up label from poll options
+  const optId = String(v.option_id);
+  const opt = (poll.options || []).find(o => String(o?.id) === optId);
+  const out = {
+    ok: true,
+    has_vote: true,
+    option_id: optId,
+    weight_used: Number(v.issued_weight_used ?? v.weight ?? 0) || 0,
+  };
+
+  const at = v.updated_at || v.created_at;
+  if (at) out.voted_at = String(at);
+
+  if (opt && typeof opt.label !== "undefined") out.option_label = String(opt.label);
+
+  return res.json(out);
 });
 
 app.get("/api/polls/:id/stream", (req, res) => {
@@ -1960,7 +2002,8 @@ function consumeStampForVote(db, stampRec, pollId) {
     stamp_hash_prefix: String(stampRec.token_hash || "").slice(0, 12),
     reason: "vote",
   });
-};
+}
+});
 
 // ---- Simple in-memory rate limit (resets on restart; good enough for MVP) ----
 const _rl = new Map(); // key -> { count, resetAtMs }
