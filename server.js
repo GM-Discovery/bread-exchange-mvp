@@ -1547,6 +1547,58 @@ app.get("/api/polls/:id/results", (req, res) => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// My ballot (authoritative "what did I vote for?") â€” identity-only (HMAC)
+// ---------------------------------------------------------------------------
+// GET /api/polls/:id/my-ballot
+// - Requires HMAC (X-Self-ID, X-Timestamp, X-Nonce, X-Signature)
+// - Resolves identity -> persona internally (no client-supplied persona)
+// - Returns minimal shape for UI selection rehydration (no internal ids / tokens)
+app.get("/api/polls/:id/my-ballot", requireSignature, (req, res) => {
+  const pollId = String(req.params.id || "");
+  const db = loadDB();
+
+  const poll = db.polls.find(p => String(p?.id) === pollId);
+  if (!poll) return res.status(404).json({ error: "poll_not_found" });
+
+  const state = readIdentityState();
+  const selfHash = req.auth?.self_id_hash;
+  const ident = findIdentityBySelfIdHash(state, selfHash);
+
+  // If the identity exists but isn't present in state for any reason, fail like other signed endpoints.
+  if (!ident) return res.status(403).json({ error: "unknown_identity" });
+
+  // Resolve persona bound to this identity. (If missing, treat as no vote.)
+  const persona = (db.personas || []).find(p => p?.meta?.identity_internal_id === ident.internal_id);
+  if (!persona) return res.json({ ok: true, has_vote: false });
+
+  // Persona-scoped uniqueness key used by vote storage
+  const uid = personaBallotUid(db, pollId, persona.id);
+
+  const v = (db.votes || []).find(x =>
+    String(x?.poll_id) === pollId && String(x?.persona_ballot_uid || x?.voter_token || "") === uid
+  );
+
+  if (!v) return res.json({ ok: true, has_vote: false });
+
+  // Optional convenience: look up label from poll options
+  const optId = String(v.option_id);
+  const opt = (poll.options || []).find(o => String(o?.id) === optId);
+  const out = {
+    ok: true,
+    has_vote: true,
+    option_id: optId,
+    weight_used: Number(v.issued_weight_used ?? v.weight ?? 0) || 0,
+  };
+
+  const at = v.updated_at || v.created_at;
+  if (at) out.voted_at = String(at);
+
+  if (opt && typeof opt.label !== "undefined") out.option_label = String(opt.label);
+
+  return res.json(out);
+});
+
 app.get("/api/polls/:id/stream", (req, res) => {
   const pollId = req.params.id;
   const db = loadDB();
