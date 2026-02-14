@@ -422,6 +422,83 @@ Caddy Basic Auth is no longer used
 
 Caddyfile comments must use # (not //)
 
+Here’s a clean Operator Notes update section you can paste directly into OPERATOR_NOTES.updated.md (or merge into main notes).
+
+?? 2026-02-14 — 403 Vote Loop Resolution
+Symptom
+
+Voting returned intermittent 403
+
+Selection did not immediately reflect after assertion
+
+Revotes attempted to use missing stamp
+
+System failed to transition to voter_token lifecycle
+
+Root Cause
+
+/api/polls and /api/polls/:id/vote are served by bread-exchange:8787
+
+Rebuilding bread-poll-mvp does not affect vote behavior.
+
+bread-exchange container was not actually replaced after rebuild.
+
+container_name: bread-exchange caused docker compose down to leave the container intact.
+
+Old image continued running.
+
+Stamp issuance logic had structural issues (now corrected), but fix was not active until proper container removal.
+
+Correct Recovery Procedure
+
+From /opt/bread-exchange-mvp:
+
+docker stop bread-exchange
+docker rm bread-exchange
+docker compose build --no-cache
+docker compose up -d --force-recreate
+
+Verification Commands
+
+Confirm exchange is serving polls:
+
+docker exec -it bread-poll-mvp-caddy-1 sh -lc \
+'curl -i http://bread-exchange:8787/api/polls'
+
+
+Confirm patched server.js is live:
+
+docker exec -it bread-exchange sh -lc \
+'grep -n "mintUpToTarget" /app/server.js'
+
+Lifecycle Validation (Post-Fix)
+
+Confirmed working:
+
+First vote consumes 1 stamp
+
+Server issues voter_token
+
+Revote uses X-Voter-Token
+
+No additional stamp consumed
+
+Refresh persists vote state
+
+No 403 on toggle
+
+Lifecycle restored:
+
+assert ? stamp ? vote ? voter_token ? revote
+
+Operational Lesson
+
+When container_name: is explicitly set, docker compose down may not remove it.
+
+Always verify running container contains expected code before debugging logic.
+
+Use direct curl against internal service (bread-exchange:8787) to isolate UI vs backend faults.
+
 Technical Stuff:
 
 root@The-Bread-Standard-First-Exchange:/opt/bread-poll-mvp# docker compose config | sed -n '/bread-exchange:/,/^[^ ]/p'

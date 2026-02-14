@@ -466,14 +466,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// Enable CORS for browser clients (dev UI is on 127.0.0.1:1430)
-app.use(cors());
-
-// IMPORTANT: respond to preflight (OPTIONS) requests with 204/200
-app.options("*", cors());
-
-app.use(express.json({ limit: "1mb" }));
-
 const REQUIRE_KEY_SESSION = process.env.REQUIRE_KEY_SESSION === "1"; // reserved for later
 // ---- Persistence (split DB) ----
 // Goal: keep identity material separate from poll/vote material.
@@ -1238,6 +1230,46 @@ app.post("/api/identity/grant-trust", requireSignature, requireOperatorKey, (req
   return res.json({ ok: true, new_earned_personal: after });
 });
 
+// GET /api/identity/summary (signed)
+// Truthful trust visibility for the current identity (no internal identifiers).
+// Response fields are safe for UI display.
+app.get("/api/identity/summary", requireSignature, (req, res) => {
+  try {
+    const selfHash = req?.auth?.self_id_hash;
+    if (!selfHash) return res.status(401).json({ error: "missing_identity" });
+
+    const state = readIdentityState();
+    const identity = findIdentityBySelfIdHash(state, String(selfHash));
+    if (!identity) return res.status(404).json({ error: "identity_not_found" });
+
+    const earned = clampEarnedPersonal(identity?.earned_personal ?? identity?.weight ?? 0);
+    const internalId = String(identity?.internal_id || "");
+
+    // ACTIVE delegation sums
+    const inbound = Number(sumActiveDelegationsIn(internalId)) || 0;
+    const outbound = Number(sumActiveDelegationsOut(internalId)) || 0;
+
+    // Available pools (waterfall semantics already encoded in these helpers)
+    const standard_available = Number(computeStandardSnapshotWeightFromIdentity(state, identity)) || 0;
+    const delegated_available = Number(computeDelegatedSnapshotWeightFromIdentity(state, identity)) || 0;
+    const combined_available = Math.max(0, standard_available) + Math.max(0, delegated_available);
+
+    return res.json({
+      ok: true,
+      public_alias: String(identity?.public_alias || ""),
+      earned_personal: earned,
+      inbound_delegated: Math.max(0, inbound),
+      outbound_delegated: Math.max(0, outbound),
+      standard_available: Math.max(0, standard_available),
+      delegated_available: Math.max(0, delegated_available),
+      combined_available: Math.max(0, combined_available),
+    });
+  } catch (e) {
+    console.error("/api/identity/summary failed:", e);
+    return res.status(500).json({ error: "summary_failed" });
+  }
+});
+
 // DELEGATION API v0
 //
 // Auth: either
@@ -1267,6 +1299,7 @@ function requireSelfOrOperator(req, res) {
 app.post("/api/stamp", requireSignature, (req, res) => {
   const db = loadDB();
 
+  // Try to resolve persona from an ACTIVE presented stamp (optional)
   let personaId = null;
   const presented = req.get(STAMP_HEADER);
   if (presented) {
@@ -1274,241 +1307,186 @@ app.post("/api/stamp", requireSignature, (req, res) => {
     if (stampRec) personaId = stampRec.persona_id;
   }
 
-  // ---- STAMP ISSUANCE ----
-  // Uses existing Caddy Basic Auth gate (treat as a "write").
-  // - If client provides a valid X-Stamp -> resolve persona, top up if below target
-  // - If no/invalid stamp -> create new persona, issue target stamps
-if (!personaId) {
-  // Optional identity proof:
-  // - If X-Self-ID is present and valid, we mint a stamp whose weight is derived from identity.
-  // - If absent, we mint an anonymous stamp (weight=1).
-  const selfIdRaw = req.get(SELF_ID_HEADER); // "X-Self-ID" (private secret)
-  let issuedWeight = 1.0;                   // anonymous default
-  let issuedTags = [];                      // snapshot tags written onto stamps
-  let standardWeight = 0.0;
-  let delegatedWeight = 0.0;
+  // Helper: mint stamps into a persona up to target (bounded by max)
+  function mintUpToTarget({ personaId, standardWeight, delegatedWeight, tags, note }) {
+    const active = countActiveStamps(db, personaId);
+    const desired = Math.min(STAMP_POOL_TARGET, STAMP_POOL_MAX);
+    const room = Math.max(0, STAMP_POOL_MAX - active);
+    const need = Math.max(0, desired - active);
+    const toIssue = Math.min(room, need);
 
-  if (selfIdRaw) {
-    const state = readIdentityState();
-    const selfHash = hashSelfId(selfIdRaw);
-    const identity = findIdentityBySelfIdHash(state, selfHash);
+    const issued = [];
 
-    if (!identity) {
-      // IMPORTANT: do not reveal whether a self_id exists.
-      // We simply deny weighted issuance (client can retry anonymous).
-      return res.status(403).json({ error: "invalid self_id" });
+    const wantStandard = Number.isFinite(Number(standardWeight)) && Number(standardWeight) > 0;
+    const wantDelegated = Number.isFinite(Number(delegatedWeight)) && Number(delegatedWeight) > 0;
+
+    let nStandard = 0;
+    let nDelegated = 0;
+
+    if (wantStandard && wantDelegated) {
+      if (toIssue >= 2) {
+        // ensure at least one of each, bias remaining to STANDARD
+        nStandard = 1 + (toIssue - 2);
+        nDelegated = 1;
+      } else if (toIssue === 1) {
+        // only room for one: mint combined so delegated isn't stranded
+        nStandard = 1;
+        nDelegated = 1;
+      }
+    } else if (wantStandard) {
+      nStandard = toIssue;
+    } else if (wantDelegated) {
+      nDelegated = toIssue;
     }
 
-    // Find or create a persona bound to this identity (server-only).
-    const persona = findOrCreatePersonaForIdentity(db, identity.internal_id);
-    personaId = persona.id;
-
-    // Snapshot weight for this stamp issuance.
-    standardWeight = computeStandardSnapshotWeightFromIdentity(state, identity);
-    delegatedWeight = computeDelegatedSnapshotWeightFromIdentity(state, identity);
-
-    // We still snapshot tags the same way
-    if (Array.isArray(identity.tags)) issuedTags = identity.tags.slice(0, 50);
-
-    // Issue stamps with explicit kinds below.
-    issuedWeight = null; // keep variable but mark unused in this branch
-  } else {
-    // Anonymous persona (no recovery model)
-    const persona = createPersona(db);
-    personaId = persona.id;
-    issuedWeight = 1.0;
-  }
-
-  // Issue pool with enforcement (identity persona may already have active stamps).
-  // This prevents active_count from exceeding pool_max when pool_max is small.
-  const active = countActiveStamps(db, personaId);
-  const issued = [];
-
-  const desired = Math.min(STAMP_POOL_TARGET, STAMP_POOL_MAX);
-  const room = Math.max(0, STAMP_POOL_MAX - active);
-  const need = Math.max(0, desired - active);
-  const toIssue = Math.min(room, need);
-
-  // v0 rule: if we have both weights > 0 and room for 2+, try to mint at least 1 of each.
-  let wantStandard = (typeof standardWeight === "number" && standardWeight > 0);
-  let wantDelegated = (typeof delegatedWeight === "number" && delegatedWeight > 0);
-
-  let nStandard = 0;
-  let nDelegated = 0;
-
-  if (wantStandard && wantDelegated) {
-    if (toIssue >= 2) {
-      nStandard = 1;
-      nDelegated = 1;
-      // any remaining slots: bias to STANDARD (so sovereign voice is never starved)
-      const remainingSlots = toIssue - 2;
-      nStandard += remainingSlots;
-    } else if (toIssue === 1) {
-      // Pool limit only allows one stamp.
-      // Mint COMBINED so delegated weight is not stranded.
-      nStandard = 1;
-      nDelegated = 1;
+    // If both are requested, mint a single COMBINED stamp instead (vote path spends one stamp)
+    if (nStandard > 0 && nDelegated > 0) {
+      const combined = Number(standardWeight) + Number(delegatedWeight);
+      const t = issueOneStamp(db, personaId, { weight: combined, tags, kind: "COMBINED" });
+      if (t) issued.push(t);
+      nStandard = 0;
+      nDelegated = 0;
     }
-  } else if (wantStandard) {
-    nStandard = toIssue;
-  } else if (wantDelegated) {
-    nDelegated = toIssue;
+
+    for (let i = 0; i < nStandard; i++) {
+      const t = issueOneStamp(db, personaId, { weight: Number(standardWeight), tags, kind: "STANDARD" });
+      if (t) issued.push(t);
+    }
+
+    for (let i = 0; i < nDelegated; i++) {
+      const t = issueOneStamp(db, personaId, { weight: Number(delegatedWeight), tags, kind: "DELEGATED" });
+      if (t) issued.push(t);
+    }
+
+    if (issued.length > 0) {
+      db.events.push({
+        kind: note || "stamp_issued",
+        persona_id: personaId,
+        at: nowIso(),
+        count: issued.length,
+        weights: {
+          standard: wantStandard ? Number(standardWeight) : null,
+          delegated: wantDelegated ? Number(delegatedWeight) : null,
+        },
+      });
+    }
+
+    return {
+      issued,
+      active_count: countActiveStamps(db, personaId),
+      target: STAMP_POOL_TARGET,
+      max: STAMP_POOL_MAX,
+      issued_weights: {
+        standard: wantStandard ? Number(standardWeight) : null,
+        delegated: wantDelegated ? Number(delegatedWeight) : null,
+      },
+      issued_weight_combined:
+        wantStandard && wantDelegated ? (Number(standardWeight) + Number(delegatedWeight)) : null,
+    };
   }
 
-  // If we would mint both kinds, mint one combined stamp instead.
-  // Reason: vote path spends a single stamp and uses stamp.weight (kind-agnostic).
-  if (nStandard > 0 && nDelegated > 0) {
-    const combined = Number(standardWeight) + Number(delegatedWeight);
-    const t = issueOneStamp(db, personaId, { weight: combined, tags: issuedTags, kind: "COMBINED" });
-    if (t) issued.push(t);
-    nStandard = 0;
-    nDelegated = 0;
-  }
+  // ==========================
+  // If no persona yet: create/bind and issue initial pool
+  // ==========================
+  if (!personaId) {
+    const selfIdRaw = req.get(SELF_ID_HEADER); // optional (identity-weighted issuance)
 
-  // Mint STANDARD
-  for (let i = 0; i < nStandard; i++) {
-    const t = issueOneStamp(db, personaId, { weight: standardWeight, tags: issuedTags, kind: "STANDARD" });
-    if (t) issued.push(t);
-  }
+    let standardWeight = 1.0;
+    let delegatedWeight = 0.0;
+    let issuedTags = [];
+    let note = "anonymous";
 
-  // Mint DELEGATED
-  for (let i = 0; i < nDelegated; i++) {
-    const t = issueOneStamp(db, personaId, { weight: delegatedWeight, tags: issuedTags, kind: "DELEGATED" });
-    if (t) issued.push(t);
-  }
+    if (selfIdRaw) {
+      const state = readIdentityState();
+      const selfHash = hashSelfId(selfIdRaw);
+      const identity = findIdentityBySelfIdHash(state, selfHash);
 
-  if (issued.length > 0) {
-    db.events.push({
-      kind: "stamp_issued",
+      if (!identity) {
+        // Do not reveal whether self_id exists; just deny weighted issuance.
+        return res.status(403).json({ error: "invalid self_id" });
+      }
+
+      const persona = findOrCreatePersonaForIdentity(db, identity.internal_id);
+      personaId = persona.id;
+
+      standardWeight = computeStandardSnapshotWeightFromIdentity(state, identity);
+      delegatedWeight = computeDelegatedSnapshotWeightFromIdentity(state, identity);
+
+      if (Array.isArray(identity.tags)) issuedTags = identity.tags.slice(0, 50);
+      note = "identity_weighted";
+    } else {
+      const persona = createPersona(db);
+      personaId = persona.id;
+      // keep default weights/tags
+    }
+
+    const minted = mintUpToTarget({
+      personaId,
+      standardWeight,
+      delegatedWeight,
+      tags: issuedTags,
+      note: "stamp_issued",
+    });
+
+    saveDB(db);
+
+    return res.json({
+      ok: true,
       persona_id: personaId,
-      at: nowIso(),
-      count: issued.length,
-      note: selfIdRaw ? "identity_weighted" : "anonymous",
-      weights: { standard: standardWeight ?? null, delegated: delegatedWeight ?? null },
+      issued: minted.issued,
+      issued_weight: null, // legacy field (unused now)
+      issued_weights: minted.issued_weights,
+      issued_weight_combined: minted.issued_weight_combined,
+      issued_tags: minted.issued.length > 0 ? issuedTags : null,
+      active_count: minted.active_count,
+      target: minted.target,
+      max: minted.max,
     });
   }
 
-  saveDB(db);
-
-  return res.json({
-    ok: true,
-    issued,                // empty array means "you already have enough"
-    issued_weight: null,
-    issued_weights: { standard: standardWeight ?? null, delegated: delegatedWeight ?? null },
-
-    // Convenience: total weight implied by issued_weights (vote path uses stamp.weight only).
-    issued_weight_combined:
-      (Number.isFinite(Number(standardWeight)) && Number.isFinite(Number(delegatedWeight)))
-        ? (Number(standardWeight) + Number(delegatedWeight))
-        : null,
-
-    issued_tags: issued.length > 0 ? issuedTags : null,
-    active_count: countActiveStamps(db, personaId),
-    target: STAMP_POOL_TARGET,
-    max: STAMP_POOL_MAX,
-  });
-}
-
-  // Persona exists: top-up logic (rotation later)
-  const active = countActiveStamps(db, personaId);
-  const issued = [];
-
-  // Top up to target (but never exceed max)
-  const desired = Math.min(STAMP_POOL_TARGET, STAMP_POOL_MAX);
-  const room = Math.max(0, STAMP_POOL_MAX - active);
-  const need = Math.max(0, desired - active);
-  const toIssue = Math.min(room, need);
-
-  // Decide weight/tags for THIS issuance (top-up is still "issuance")
-  let topUpWeight = 1.0;
+  // ==========================
+  // Persona exists: top-up (respect pool_target/pool_max)
+  // ==========================
+  let topUpStandardWeight = 1.0;
+  let topUpDelegatedWeight = 0.0;
   let topUpTags = [];
 
-  // If this persona is identity-bound, use identity state to snapshot the weight now.
   const personaRec = (db.personas || []).find(p => p && p.id === personaId) || null;
   const identityInternalId = personaRec?.meta?.identity_internal_id;
 
   if (identityInternalId) {
     const state = readIdentityState();
     const identity = findIdentityByInternalId(state, identityInternalId);
-
-    let topUpStandardWeight = 1.0;
-    let topUpDelegatedWeight = 0.0;
-
     if (identity) {
       topUpStandardWeight = computeStandardSnapshotWeightFromIdentity(state, identity);
       topUpDelegatedWeight = computeDelegatedSnapshotWeightFromIdentity(state, identity);
-
       if (Array.isArray(identity.tags)) topUpTags = identity.tags.slice(0, 50);
     }
-
-  const wantStandard = Number.isFinite(topUpStandardWeight) && topUpStandardWeight > 0;
-  const wantDelegated = Number.isFinite(topUpDelegatedWeight) && topUpDelegatedWeight > 0;
-
-  let nStandard = 0;
-  let nDelegated = 0;
-
-  if (wantStandard && wantDelegated) {
-    if (toIssue >= 2) {
-      nStandard = 1;
-      nDelegated = 1;
-      nStandard += (toIssue - 2);
-    } else if (toIssue === 1) {
-      // Pool limit only allows one stamp.
-      // Mint COMBINED so delegated weight is not stranded.
-      nStandard = 1;
-      nDelegated = 1;
-    }
-  } else if (wantStandard) {
-    nStandard = toIssue;
-  } else if (wantDelegated) {
-    nDelegated = toIssue;
   }
 
-  // If we would mint both kinds, mint one combined stamp instead.
-  // Reason: vote path spends a single stamp and uses stamp.weight (kind-agnostic).
-  if (nStandard > 0 && nDelegated > 0) {
-    const combined = Number(topUpStandardWeight) + Number(topUpDelegatedWeight);
-    const t = issueOneStamp(db, personaId, { weight: combined, tags: topUpTags, kind: "COMBINED" });
-    if (t) issued.push(t);
-    nStandard = 0;
-    nDelegated = 0;
-  }
-
-  for (let i = 0; i < nStandard; i++) {
-    const t = issueOneStamp(db, personaId, { weight: topUpStandardWeight, tags: topUpTags, kind: "STANDARD" });
-    if (t) issued.push(t);
-  }
-  for (let i = 0; i < nDelegated; i++) {
-    const t = issueOneStamp(db, personaId, { weight: topUpDelegatedWeight, tags: topUpTags, kind: "DELEGATED" });
-    if (t) issued.push(t);
-  }
-
-
-
-  if (issued.length > 0) {
-    db.events.push({ kind: "stamp_topped_up", persona_id: personaId, at: nowIso(), count: issued.length });
-  }
+  const minted = mintUpToTarget({
+    personaId,
+    standardWeight: topUpStandardWeight,
+    delegatedWeight: topUpDelegatedWeight,
+    tags: topUpTags,
+    note: "stamp_topped_up",
+  });
 
   saveDB(db);
 
   return res.json({
     ok: true,
-    issued,
-    issued_weight: null, // legacy single-field; identity issuance may mint multiple kinds
-    issued_weights: { standard: standardWeight ?? null, delegated: delegatedWeight ?? null },
-
-    // Total implied weight (standard + delegated). No behavior change; convenience for callers.
-    issued_weight_combined:
-      (Number.isFinite(Number(standardWeight)) && Number.isFinite(Number(delegatedWeight)))
-        ? (Number(standardWeight) + Number(delegatedWeight))
-        : null,
-
-    issued_tags: issued.length > 0 ? issuedTags : null,
-    active_count: countActiveStamps(db, personaId),
-    target: STAMP_POOL_TARGET,
-    max: STAMP_POOL_MAX,
+    persona_id: personaId,
+    issued: minted.issued,
+    issued_weight: null,
+    issued_weights: minted.issued_weights,
+    issued_weight_combined: minted.issued_weight_combined,
+    issued_tags: minted.issued.length > 0 ? topUpTags : null,
+    active_count: minted.active_count,
+    target: minted.target,
+    max: minted.max,
   });
-};
+});
 
 app.get("/api/polls", (req, res) => {
   const db = loadDB();
@@ -1567,59 +1545,6 @@ app.get("/api/polls/:id/results", (req, res) => {
     weights_used: r.weights_used,
     validated: r.validated,
   });
-});
-
-
-// ---------------------------------------------------------------------------
-// My ballot (authoritative "what did I vote for?") — identity-only (HMAC)
-// ---------------------------------------------------------------------------
-// GET /api/polls/:id/my-ballot
-// - Requires HMAC (X-Self-ID, X-Timestamp, X-Nonce, X-Signature)
-// - Resolves identity -> persona internally (no client-supplied persona)
-// - Returns minimal shape for UI selection rehydration (no internal ids / tokens)
-app.get("/api/polls/:id/my-ballot", requireSignature, (req, res) => {
-  const pollId = String(req.params.id || "");
-  const db = loadDB();
-
-  const poll = db.polls.find(p => String(p?.id) === pollId);
-  if (!poll) return res.status(404).json({ error: "poll_not_found" });
-
-  const state = readIdentityState();
-  const selfHash = req.auth?.self_id_hash;
-  const ident = findIdentityBySelfIdHash(state, selfHash);
-
-  // If the identity exists but isn't present in state for any reason, fail like other signed endpoints.
-  if (!ident) return res.status(403).json({ error: "unknown_identity" });
-
-  // Resolve persona bound to this identity. (If missing, treat as no vote.)
-  const persona = (db.personas || []).find(p => p?.meta?.identity_internal_id === ident.internal_id);
-  if (!persona) return res.json({ ok: true, has_vote: false });
-
-  // Persona-scoped uniqueness key used by vote storage
-  const uid = personaBallotUid(db, pollId, persona.id);
-
-  const v = (db.votes || []).find(x =>
-    String(x?.poll_id) === pollId && String(x?.persona_ballot_uid || x?.voter_token || "") === uid
-  );
-
-  if (!v) return res.json({ ok: true, has_vote: false });
-
-  // Optional convenience: look up label from poll options
-  const optId = String(v.option_id);
-  const opt = (poll.options || []).find(o => String(o?.id) === optId);
-  const out = {
-    ok: true,
-    has_vote: true,
-    option_id: optId,
-    weight_used: Number(v.issued_weight_used ?? v.weight ?? 0) || 0,
-  };
-
-  const at = v.updated_at || v.created_at;
-  if (at) out.voted_at = String(at);
-
-  if (opt && typeof opt.label !== "undefined") out.option_label = String(opt.label);
-
-  return res.json(out);
 });
 
 app.get("/api/polls/:id/stream", (req, res) => {
@@ -2002,8 +1927,7 @@ function consumeStampForVote(db, stampRec, pollId) {
     stamp_hash_prefix: String(stampRec.token_hash || "").slice(0, 12),
     reason: "vote",
   });
-}
-});
+};
 
 // ---- Simple in-memory rate limit (resets on restart; good enough for MVP) ----
 const _rl = new Map(); // key -> { count, resetAtMs }
