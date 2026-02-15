@@ -1009,6 +1009,69 @@ app.post("/api/delegation/set", requireSignature, (req, res) => {
   });
 });
 
+// GET /api/delegation/outbound
+// Auth: signed (HMAC) only.
+// Returns ACTIVE outbound delegations for the caller identity (no internal ids).
+app.get("/api/delegation/outbound", requireSignature, (req, res) => {
+  try {
+    const state = readIdentityState();
+
+    // req.auth is set by requireSignature
+    const selfHash = String(req.auth?.self_id_hash || "");
+    const identity = findIdentityBySelfIdHash(state, selfHash);
+    if (!identity) return res.status(403).json({ error: "unknown_identity" });
+
+    const delegatorInternalId = String(identity.internal_id || "");
+
+    const d = readDelegations();
+    const rows = Array.isArray(d.delegations) ? d.delegations : [];
+
+    // Derive an informational expiry timestamp (not yet enforced).
+    // v0 aspiration: a delegation expires 1 year after created_at.
+    function deriveExpiresAt(createdAtIso) {
+      const t = Date.parse(String(createdAtIso || ""));
+      if (!Number.isFinite(t)) return null;
+      const oneYearMs = 365 * 24 * 60 * 60 * 1000;
+      return new Date(t + oneYearMs).toISOString();
+    }
+
+    const outbound = [];
+    for (const r of rows) {
+      if (!r) continue;
+      if (r.status !== "ACTIVE") continue;
+      if (String(r.delegator_internal_id || "") !== delegatorInternalId) continue;
+
+      const amt = Number(r.amount);
+      if (!Number.isFinite(amt) || amt <= 0) continue;
+
+      const delegatee = findIdentityByInternalId(state, String(r.delegatee_internal_id || ""));
+      outbound.push({
+        delegatee_alias: delegatee?.public_alias ? String(delegatee.public_alias) : null,
+        amount: amt,
+        status: "ACTIVE",
+        created_at: r.created_at || null,
+        updated_at: r.updated_at || null,
+        expires_at: deriveExpiresAt(r.created_at),
+      });
+    }
+
+    // Newest-first (updated_at, then created_at)
+    outbound.sort((a, b) => {
+      const ta = Date.parse(String(a.updated_at || a.created_at || "")) || 0;
+      const tb = Date.parse(String(b.updated_at || b.created_at || "")) || 0;
+      return tb - ta;
+    });
+
+    // Guardrail cap for UI legibility
+    const cap = 200;
+
+    return res.json({ ok: true, outbound: outbound.slice(0, cap), cap });
+  } catch (e) {
+    console.error("/api/delegation/outbound failed:", e);
+    return res.status(500).json({ error: "outbound_failed" });
+  }
+});
+
 // ---- Static frontend ----
 app.use(express.static(path.join(__dirname, "public")));
 
@@ -1554,6 +1617,7 @@ app.get("/api/polls/:id/results", (req, res) => {
 // - Requires HMAC (X-Self-ID, X-Timestamp, X-Nonce, X-Signature)
 // - Resolves identity -> persona internally (no client-supplied persona)
 // - Returns minimal shape for UI selection rehydration (no internal ids / tokens)
+
 app.get("/api/polls/:id/my-ballot", requireSignature, (req, res) => {
   const pollId = String(req.params.id || "");
   const db = loadDB();
