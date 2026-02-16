@@ -83,7 +83,7 @@ function loadConfig() {
     lifecycle: {
       opinion_retention_seconds: 7 * 24 * 60 * 60,
       governance_retention_seconds: 30 * 24 * 60 * 60,
-      governance_cooldown_seconds: 60 * 60,
+      governance_cooldown_seconds: 3 * 24 * 60 * 60,
     },
     security: { ballot_uid_salt: { min_length: 16, bytes: 32 } },
   };
@@ -316,6 +316,142 @@ const cfg = loadConfig();
 const lifecycle = require("./lib/lifecycle");
 const { applyLifecycle, canVote, isVisibleInList, nowIso } = lifecycle;
 
+// --- Canonical JSON + hashing (for commitments) ---
+// We use deterministic JSON serialization to produce stable hashes.
+// This is NOT meant to be fast; it's meant to be predictable.
+function canonicalJsonStringify(value) {
+  function sortObject(obj) {
+    if (obj === null || obj === undefined) return obj;
+    if (Array.isArray(obj)) return obj.map(sortObject);
+    if (typeof obj !== "object") return obj;
+
+    const keys = Object.keys(obj).sort();
+    const out = {};
+    for (const k of keys) out[k] = sortObject(obj[k]);
+    return out;
+  }
+  return JSON.stringify(sortObject(value));
+}
+
+function sha256Hex(s) {
+  return crypto.createHash("sha256").update(String(s), "utf8").digest("hex");
+}
+
+// --- Delegation chain resolver (deterministic single-path) ---
+// For v0 represented-map snapshotting, we resolve a single "effective rep" by:
+// - taking the ACTIVE outbound delegation edge with the largest amount
+// - following that edge recursively until no outbound edge exists
+// - if a cycle is detected, we stop at the last safe node and flag it
+function resolveEffectiveRepresentativeInternalId(state, originInternalId) {
+  const d = readDelegations();
+  const rows = Array.isArray(d.delegations) ? d.delegations : [];
+
+  const seen = new Set();
+  let cur = String(originInternalId || "");
+  let chainLen = 0;
+  const flags = {};
+
+  while (cur && !seen.has(cur)) {
+    seen.add(cur);
+
+    // Find strongest ACTIVE outbound edge
+    let best = null;
+    for (const r of rows) {
+      if (!r) continue;
+      if (r.status !== "ACTIVE") continue;
+      if (String(r.delegator_internal_id) !== cur) continue;
+      const amt = Number(r.amount);
+      if (!Number.isFinite(amt) || amt <= 0) continue;
+
+      if (!best) {
+        best = { delegatee_internal_id: String(r.delegatee_internal_id), amount: amt };
+        continue;
+      }
+
+      // Prefer larger amount; tie-break lexicographically for determinism
+      if (amt > best.amount) {
+        best = { delegatee_internal_id: String(r.delegatee_internal_id), amount: amt };
+      } else if (amt === best.amount) {
+        const a = String(r.delegatee_internal_id);
+        const b = String(best.delegatee_internal_id);
+        if (a < b) best = { delegatee_internal_id: a, amount: amt };
+      }
+    }
+
+    if (!best || !best.delegatee_internal_id) break;
+
+    cur = best.delegatee_internal_id;
+    chainLen += 1;
+  }
+
+  if (seen.has(cur) && chainLen > 0) {
+    flags.cycle = true;
+  }
+
+  return { effective_internal_id: cur || String(originInternalId || ""), chain_len: chainLen, flags };
+}
+
+// Compute + persist represented_map on FIRST close.
+// Returns { ok, represented_map, represented_map_hash } or null if not applicable.
+function computeRepresentedMapSnapshotIfNeeded(db, poll) {
+  if (!db || !poll) return null;
+
+  // Only run once per poll.
+  if (poll.represented_map && poll.represented_map_hash) return null;
+
+  const tClose = poll.closed_at ? String(poll.closed_at) : nowIso();
+
+  // Origin set: voters-only, derived from vote records.
+  const votes = (db.votes || []).filter(v => v && v.poll_id === poll.id);
+
+  const state = readIdentityState();
+
+  // Build entries keyed by origin public_alias.
+  // We skip votes that don't carry persona_id (older data).
+  const entries = [];
+
+  for (const v of votes) {
+    const personaId = v.persona_id ? String(v.persona_id) : "";
+    if (!personaId) continue;
+
+    const persona = (db.personas || []).find(p => p && String(p.id) === personaId) || null;
+    const originInternalId = persona?.meta?.identity_internal_id ? String(persona.meta.identity_internal_id) : "";
+    if (!originInternalId) continue;
+
+    const originIdentity = findIdentityByInternalId(state, originInternalId);
+    const originAlias = originIdentity ? String(originIdentity.public_alias || "") : "";
+    if (!originAlias) continue;
+
+    const rep = resolveEffectiveRepresentativeInternalId(state, originInternalId);
+    const repIdentity = findIdentityByInternalId(state, rep.effective_internal_id);
+    const repAlias = repIdentity ? String(repIdentity.public_alias || "") : originAlias;
+
+    // voters-only => origin voted, so represented option is origin's option.
+    const representedOptionId = v.option_id !== undefined ? String(v.option_id) : null;
+
+    entries.push({
+      origin_key: originAlias,
+      effective_rep_key: repAlias,
+      represented_option_id: representedOptionId,
+      chain_len: rep.chain_len,
+      flags: rep.flags && Object.keys(rep.flags).length ? rep.flags : {},
+    });
+  }
+
+  // Deterministic ordering:
+  entries.sort((a, b) => (a.origin_key < b.origin_key ? -1 : (a.origin_key > b.origin_key ? 1 : 0)));
+
+  const canonical = canonicalJsonStringify(entries);
+  const h = sha256Hex(canonical);
+
+  poll.t_close = poll.t_close || tClose;
+  poll.represented_map = entries;
+  poll.represented_map_hash = h;
+
+  return { ok: true, represented_map: entries, represented_map_hash: h };
+}
+
+
 // ---- Config fingerprint (safe subset only) ----
 // We fingerprint ONLY the safe public subset (stamps + lifecycle).
 function stableStringify(value) {
@@ -546,13 +682,14 @@ function migrateLegacyDbIfNeeded() {
 function loadDB() {
   migrateLegacyDbIfNeeded();
 
-  const exchange = readJsonOrInit(EXCHANGE_DB_PATH, { polls: [], votes: [], events: [] });
+  const exchange = readJsonOrInit(EXCHANGE_DB_PATH, { polls: [], votes: [], events: [], overrides: [] });
   const identity = readJsonOrInit(IDENTITY_DB_PATH, { personas: [], stamps: [], keys: [], challenges: [] });
 
   // Backfill new arrays if someone hand-edited files
   if (!Array.isArray(exchange.polls)) exchange.polls = [];
   if (!Array.isArray(exchange.votes)) exchange.votes = [];
   if (!Array.isArray(exchange.events)) exchange.events = [];
+  if (!Array.isArray(exchange.overrides)) exchange.overrides = [];
 
   if (!Array.isArray(identity.personas)) identity.personas = [];
   if (!Array.isArray(identity.stamps)) identity.stamps = [];
@@ -564,6 +701,7 @@ function loadDB() {
     polls: exchange.polls,
     votes: exchange.votes,
     events: exchange.events,
+    overrides: exchange.overrides,
 
     personas: identity.personas,
     stamps: identity.stamps,
@@ -579,6 +717,7 @@ function saveDB(db) {
     polls: Array.isArray(db.polls) ? db.polls : [],
     votes: Array.isArray(db.votes) ? db.votes : [],
     events: Array.isArray(db.events) ? db.events : [],
+    overrides: Array.isArray(db.overrides) ? db.overrides : [],
   });
 
   // Identity / authority state
@@ -1558,7 +1697,16 @@ app.get("/api/polls", (req, res) => {
 
   // Apply lifecycle + snapshot persistence
   for (const p of db.polls) {
+    const prevClosedAt = p.closed_at ? String(p.closed_at) : null;
+
     const life = applyLifecycle(p, t);
+
+    // If this tick caused the FIRST close, persist represented_map snapshot (voters-only).
+    // We key off closed_at becoming non-null (works even if GOV immediately enters cooldown).
+    if (!prevClosedAt && p.closed_at) {
+      const snap = computeRepresentedMapSnapshotIfNeeded(db, p);
+      if (snap) changedAny = true;
+    }
 
     const usesFinalSnapshot =
       p.poll_class === "LEGITIMACY" || p.poll_class === "GOVERNANCE";
@@ -1569,6 +1717,15 @@ app.get("/api/polls", (req, res) => {
     // Persist snapshot at finalize, or backfill once if already locked
     if (usesFinalSnapshot && (life.didFinalize || isLocked) && !p.snapshot_results) {
       p.snapshot_results = computeResults(db, p.id);
+
+      // Commitment for the final tally (based on canonical totals)
+      try {
+        const canonicalTotals = canonicalJsonStringify(p.snapshot_results?.totals || {});
+        p.final_tally_hash = sha256Hex(canonicalTotals);
+      } catch (_) {
+        // fail-closed: don't block poll listing
+      }
+
       changedAny = true;
     }
 
@@ -1580,10 +1737,12 @@ app.get("/api/polls", (req, res) => {
   // Build response using authoritative results
   const polls = db.polls
     .filter(p => isVisibleInList(p, nowIso()))
-    .map(p => ({
-      ...p,
-      results: getAuthoritativeResults(db, p),
-    }));
+    .map(p => {
+      // Privacy posture: represented_map must never be public.
+      const pub = { ...p, results: getAuthoritativeResults(db, p) };
+      delete pub.represented_map;
+      return pub;
+    });
 
   res.json({ polls });
 });
@@ -1681,7 +1840,11 @@ app.get("/api/polls/:id/stream", (req, res) => {
   subscribers.get(pollId).add(res);
 
   // Send initial state on connect (so UI can render immediately)
-  sseSend(res, "poll", { poll });
+  {
+    const pub = { ...poll };
+    delete pub.represented_map;
+    sseSend(res, "poll", { poll: pub });
+  }
   sseSend(res, "results", { poll_id: pollId, results: getAuthoritativeResults(db, poll) });
 
   // Cleanup on disconnect
@@ -1708,6 +1871,7 @@ app.post("/api/polls", (req, res) => {
     title: String(title).slice(0, 200),
     description: description ? String(description).slice(0, 5000) : "",
     type: type ? String(type) : "single",
+    poll_class: req.body?.poll_class ? String(req.body.poll_class) : null,
     options: options.map((o, idx) => ({
       id: o && o.id ? String(o.id) : String(idx + 1),
       label: o && o.label ? String(o.label).slice(0, 200) : `Option ${idx + 1}`,
@@ -1720,6 +1884,21 @@ app.post("/api/polls", (req, res) => {
     meta: req.body?.meta || {},
   };
 
+
+  // Default expiry to reduce clutter for non-legitimacy polls:
+  // - If not flagged LEGITIMACY/GOVERNANCE and expires_at is unset, expire in 7 days.
+  // (Legitimacy polls may run longer and should be configured explicitly by UI later.)
+  const isLegitimacyish =
+    poll.poll_class === "LEGITIMACY" ||
+    poll.poll_class === "GOVERNANCE" ||
+    (Array.isArray(poll?.meta?.tags) && poll.meta.tags.includes("legitimacy")) ||
+    (typeof poll.cooldown_seconds === "number" && poll.cooldown_seconds > 0);
+
+  if (!poll.expires_at && !isLegitimacyish) {
+    const nowMs = Date.now();
+    const weekMs = 7 * 24 * 60 * 60 * 1000;
+    poll.expires_at = new Date(nowMs + weekMs).toISOString();
+  }
   db.polls.unshift(poll);
   db.events.push({ kind: "poll_created", poll_id: id, at: nowIso() });
   saveDB(db);
@@ -1748,6 +1927,12 @@ app.post("/api/polls/:id/vote", (req, res) => {
   if (life.changed) saveDB(db);
 
   if (!canVote(poll)) return res.status(400).json({ error: "poll is closed" });
+
+  // Cooldown (governance/legitimacy) is override-only: no new stamp votes.
+  // Voters-only eligibility is enforced by requiring an existing X-Voter-Token.
+  if (String(poll.status) === "cooldown" && !presentedVoterToken) {
+    return res.status(403).json({ error: "cooldown_override_only" });
+  }
 
   // ----------------------------
   // REVOTE PATH (no stamp)
@@ -1839,6 +2024,7 @@ app.post("/api/polls/:id/vote", (req, res) => {
     id: nanoid(12),
     poll_id: pollId,
     option_id: String(option_id),
+    persona_id: String(personaId),
 
     // Stored as voter_token for backward compatibility with existing API shape.
     // Semantically this is the poll-scoped ballot uid.
@@ -1924,6 +2110,18 @@ function computeResults(db, pollId) {
 
   const votes = db.votes.filter(v => v.poll_id === pollId);
 
+  // Overrides (delta-only): if present for a given voter_token, use override option_id for tally.
+  // We intentionally do NOT mutate the original vote record.
+  const overrideByToken = new Map();
+  if (Array.isArray(db.overrides)) {
+    for (const o of db.overrides) {
+      if (!o) continue;
+      if (o.poll_id !== pollId) continue;
+      if (!o.voter_token) continue;
+      overrideByToken.set(String(o.voter_token), String(o.override_option_id));
+    }
+  }
+
   // Stats for audit clarity (computational weights given)
   let wMin = null;
   let wMax = null;
@@ -1931,14 +2129,18 @@ function computeResults(db, pollId) {
   let wCount = 0;
 
   for (const v of votes) {
-    if (totals[v.option_id] === undefined) continue;
+    const tokenKey = v.voter_token || v.persona_ballot_uid || "";
+    const overrideOpt = tokenKey ? overrideByToken.get(String(tokenKey)) : null;
+    const effOptionId = overrideOpt ? String(overrideOpt) : String(v.option_id);
+
+    if (totals[effOptionId] === undefined) continue;
 
     // Defensive: a bad stored weight must never turn totals into NaN.
     // (Vote endpoint should already enforce weight > 0.)
     const w = Number(v.weight);
     if (!Number.isFinite(w) || w <= 0) continue;
 
-    totals[v.option_id] += w;
+    totals[effOptionId] += w;
 
     wMin = (wMin === null) ? w : Math.min(wMin, w);
     wMax = (wMax === null) ? w : Math.max(wMax, w);
@@ -2091,6 +2293,87 @@ function generatePublicAlias() {
 console.log(`[config] fingerprint sha256=${CFG_FINGERPRINT}`);
 
 const PORT = process.env.PORT || 8787;
+
+
+// POST /api/polls/:id/override
+// - Cooldown-only replacement of the origin's own choice (voters-only eligibility)
+// - Auth: X-Voter-Token only (no stamps issued or consumed)
+app.post("/api/polls/:id/override", (req, res) => {
+  const pollId = req.params.id;
+  const { option_id } = req.body || {};
+  if (!option_id) return res.status(400).json({ error: "option_id is required" });
+
+  const token = req.get(VOTER_TOKEN_HEADER);
+  if (!token) return res.status(401).json({ error: "missing X-Voter-Token" });
+
+  const db = loadDB();
+  const poll = db.polls.find(p => p.id === pollId);
+  if (!poll) return res.status(404).json({ error: "poll not found" });
+
+  // Apply lifecycle (ensures status/cooldown timing is current)
+  const life = applyLifecycle(poll, nowIso());
+  if (life.changed) saveDB(db);
+
+  // Override window == cooldown
+  if (String(poll.status) !== "cooldown") {
+    return res.status(403).json({ error: "poll_finalized_or_override_closed" });
+  }
+
+  // option_id must exist on this poll
+  const optOk = Array.isArray(poll.options) && poll.options.some(o => o && String(o.id) === String(option_id));
+  if (!optOk) return res.status(400).json({ error: "invalid_option_id" });
+
+  const t = String(token);
+
+  // Voters-only: token must already correspond to an existing vote for this poll
+  const prev = db.votes.find(v =>
+    v && v.poll_id === pollId && (String(v.voter_token) === t || String(v.persona_ballot_uid) === t)
+  );
+  if (!prev) return res.status(403).json({ error: "voters_only_override" });
+
+  // Record override (separate store; last-write-wins)
+  if (!Array.isArray(db.overrides)) db.overrides = [];
+  db.overrides = db.overrides.filter(o => !(o && o.poll_id === pollId && String(o.voter_token) === t));
+
+  const at = nowIso();
+
+  // Best-effort enrich for future analytics ("who gets overridden a lot").
+  // This is not required for correctness; we avoid failing the override if enrichment can't be derived.
+  let origin_key = null;
+  let effective_rep_key = null;
+  try {
+    const personaId = prev.persona_id ? String(prev.persona_id) : "";
+    if (personaId) {
+      const persona = (db.personas || []).find(p => p && String(p.id) === personaId) || null;
+      const originInternalId = persona?.meta?.identity_internal_id ? String(persona.meta.identity_internal_id) : "";
+      if (originInternalId) {
+        const state = readIdentityState();
+        const originIdentity = findIdentityByInternalId(state, originInternalId);
+        origin_key = originIdentity ? String(originIdentity.public_alias || "") : null;
+
+        const rep = resolveEffectiveRepresentativeInternalId(state, originInternalId);
+        const repIdentity = findIdentityByInternalId(state, rep.effective_internal_id);
+        effective_rep_key = repIdentity ? String(repIdentity.public_alias || "") : origin_key;
+      }
+    }
+  } catch (_) {}
+
+  db.overrides.push({
+    poll_id: pollId,
+    voter_token: t,
+    override_option_id: String(option_id),
+    override_ts: at,
+    origin_key,
+    effective_rep_key,
+  });
+
+  // Do NOT change stored vote weights; override is delta-only choice replacement.
+  // We keep the original vote record intact and apply overrides at final tally time.
+  db.events.push({ kind: "vote_override_set", poll_id: pollId, at });
+  saveDB(db);
+
+  return res.json({ ok: true });
+});
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Bread Exchange MVP running on http://localhost:${PORT}`);
 });
