@@ -314,6 +314,7 @@ function requireOperatorKey(req, res, next) {
 const cfg = loadConfig();
 // Load lifecycle as an object so we can call lifecycle.setDefaults(...)
 const lifecycle = require("./lib/lifecycle");
+const federation = require("./lib/federation");
 const { applyLifecycle, canVote, isVisibleInList, nowIso } = lifecycle;
 
 // --- Canonical JSON + hashing (for commitments) ---
@@ -488,6 +489,16 @@ const CFG_FINGERPRINT = crypto
 if (typeof lifecycle.setDefaults === "function") {
   lifecycle.setDefaults(cfg.lifecycle);
 }
+
+// Federation v0 (partner-allowlisted commitments + dispute artifacts)
+// - Uses Ed25519 signatures (separate from HMAC client auth)
+// - Stores private federation identity and partner allowlist in DATA_DIR
+try {
+  federation.installFederationRoutes(app);
+} catch (e) {
+  console.error("[federation] failed to install federation routes:", e);
+}
+
 
 // Values now come from config (defaults match previous constants)
 const STAMP_POOL_TARGET = cfg.stamps.pool_target; // general average active signatures, too high = salt guesses too low = no vote
@@ -1725,8 +1736,97 @@ app.get("/api/polls", (req, res) => {
       } catch (_) {
         // fail-closed: don't block poll listing
       }
+      // -------------------------------
+      // Federation commitment injection
+      // -------------------------------
+      try {
+        // Deterministic override delta hash (content-only)
+        const overridesForPoll = (db.overrides || [])
+          .filter(o => o && o.poll_id === p.id)
+          .map(o => ({
+            voter_token: String(o.voter_token || ""),
+            override_option_id: String(o.override_option_id || ""),
+            override_ts: o.override_ts ? String(o.override_ts) : null
+          }))
+          .sort((a, b) => {
+            if (a.voter_token !== b.voter_token) {
+              return a.voter_token < b.voter_token ? -1 : 1;
+            }
+            if (a.override_ts !== b.override_ts) {
+              return a.override_ts < b.override_ts ? -1 : 1;
+            }
+            return a.override_option_id < b.override_option_id ? -1 : 1;
+          });
+
+        const canonicalOverrides = canonicalJsonStringify(overridesForPoll);
+        p.override_delta_hash = sha256Hex(canonicalOverrides);
+
+        // Represented map hash already exists from close snapshot
+        const representedMapHash = p.represented_map_hash || null;
+
+        // Install/update federation commitment
+        if (federation && typeof federation.upsertLocalCommitmentForPoll === "function") {
+          federation.upsertLocalCommitmentForPoll(db, p, {
+            final_tally_hash: p.final_tally_hash,
+            override_delta_hash: p.override_delta_hash,
+            represented_map_hash: representedMapHash,
+            config_fingerprint: CFG_FINGERPRINT
+          });
+        }
+      } catch (e) {
+        console.error("[federation] commitment injection failed:", e);
+      }
 
       changedAny = true;
+    }
+
+    // -----------------------------------------------
+    // Federation commitment backfill for already-locked polls
+    // (If snapshot_results already existed before federation landed)
+    // -----------------------------------------------
+    if (usesFinalSnapshot && (life.didFinalize || isLocked) && p.snapshot_results) {
+      try {
+        // Ensure final_tally_hash exists
+        if (!p.final_tally_hash) {
+          const canonicalTotals = canonicalJsonStringify(p.snapshot_results?.totals || {});
+          p.final_tally_hash = sha256Hex(canonicalTotals);
+          changedAny = true;
+        }
+
+        // Ensure override_delta_hash exists (content-only)
+        if (!p.override_delta_hash) {
+          const overridesForPoll = (db.overrides || [])
+            .filter(o => o && o.poll_id === p.id)
+            .map(o => ({
+              voter_token: String(o.voter_token || ""),
+              override_option_id: String(o.override_option_id || ""),
+              override_ts: o.override_ts ? String(o.override_ts) : null,
+            }))
+            .sort((a, b) => {
+              if (a.voter_token !== b.voter_token) return a.voter_token < b.voter_token ? -1 : 1;
+              const at = String(a.override_ts || "");
+              const bt = String(b.override_ts || "");
+              if (at !== bt) return at < bt ? -1 : 1;
+              return a.override_option_id < b.override_option_id ? -1 : 1;
+            });
+
+          p.override_delta_hash = sha256Hex(canonicalJsonStringify(overridesForPoll));
+          changedAny = true;
+        }
+
+        // Upsert local commitment (idempotent)
+        if (federation && typeof federation.upsertLocalCommitmentForPoll === "function") {
+          federation.upsertLocalCommitmentForPoll(db, p, {
+            final_tally_hash: p.final_tally_hash,
+            override_delta_hash: p.override_delta_hash,
+            represented_map_hash: p.represented_map_hash || null,
+            config_fingerprint: CFG_FINGERPRINT,
+          });
+          changedAny = true;
+        }
+      } catch (e) {
+        console.error("[federation] commitment backfill failed:", e);
+      }
     }
 
     if (life.changed) changedAny = true;
