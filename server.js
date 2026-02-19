@@ -494,7 +494,7 @@ if (typeof lifecycle.setDefaults === "function") {
 // - Uses Ed25519 signatures (separate from HMAC client auth)
 // - Stores private federation identity and partner allowlist in DATA_DIR
 try {
-  federation.installFederationRoutes(app);
+  federation.installFederationRoutes(app, { loadDB });
 } catch (e) {
   console.error("[federation] failed to install federation routes:", e);
 }
@@ -1984,6 +1984,30 @@ app.post("/api/polls", (req, res) => {
     meta: req.body?.meta || {},
   };
 
+  // ---- queue_no (assert-time; informational; operator may later clear it) ----
+  // We only assign queue_no if it is currently missing.
+  // Band selection comes from meta.tags scope:* (default scope:exchange).
+  if (poll.queue_no == null) {
+    const tags = Array.isArray(poll?.meta?.tags) ? poll.meta.tags.map(String) : [];
+    const scopeTag = tags.find(t => t.startsWith("scope:")) || "scope:exchange";
+
+    const BANDS = {
+      "scope:device": 1,
+      "scope:exchange": 101,
+      "scope:supernode": 201,
+      "scope:municipality": 301,
+      "scope:national": 401,
+      "scope:state": 501,
+      "scope:county": 601,
+    };
+
+    const bandStart = BANDS[scopeTag] || 101;
+
+    // Slot within the 100-wide band.
+    // MVP: derive from current poll count so it is stable and cheap.
+    const slot = (Number(db.polls.length) % 100); // 0..99
+    poll.queue_no = bandStart + slot;
+  }
 
   // Default expiry to reduce clutter for non-legitimacy polls:
   // - If not flagged LEGITIMACY/GOVERNANCE and expires_at is unset, expire in 7 days.
