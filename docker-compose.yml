@@ -1,21 +1,39 @@
 services:
+  caddy:
+    image: caddy:2-alpine
+    container_name: bread-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./ui:/srv/ui:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - bread_net
+
   bread-exchange:
     build: .
     container_name: bread-exchange
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      - NODE_ENV=production
+      # OPERATOR_KEY is already in .env; keeping this is optional redundancy.
+      - OPERATOR_KEY=${OPERATOR_KEY}
     volumes:
       - ./data:/app/data
     expose:
       - "8787"
-    environment:
-      - NODE_ENV=production
-      - OPERATOR_KEY=${OPERATOR_KEY}
     networks:
-      - caddy_net
+      - bread_net
 
 networks:
-  caddy_net:
-    external: true
-    name: bread-poll-mvp_default
+  bread_net:
+
+volumes:
+  caddy_data:
+  caddy_config:

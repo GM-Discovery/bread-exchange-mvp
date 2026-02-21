@@ -392,6 +392,33 @@ function resolveEffectiveRepresentativeInternalId(state, originInternalId) {
   return { effective_internal_id: cur || String(originInternalId || ""), chain_len: chainLen, flags };
 }
 
+function computePollFingerprint(p) {
+  // Fingerprint the poll *definition* (what it is), not its lifecycle timestamps.
+  // Keep stable + deterministic. No created_at/closed_at/finalized_at/published_at/ts.
+  const def = {
+    id: String(p.id || ""),
+    poll_class: p.poll_class != null ? String(p.poll_class) : null,
+    type: p.type != null ? String(p.type) : null,
+    title: p.title != null ? String(p.title) : null,
+    description: p.description != null ? String(p.description) : null,
+
+    // Preserve option order. Each option’s identity + display label matter.
+    options: Array.isArray(p.options)
+      ? p.options.map(o => ({
+          option_id: String((o && (o.option_id || o.id)) || ""),
+          label: o && o.label != null
+            ? String(o.label)
+            : (o && o.text != null ? String(o.text) : null),
+        }))
+      : null,
+
+    // Meta can affect meaning; include it canonically if present.
+    meta: (p && p.meta && typeof p.meta === "object") ? p.meta : null,
+  };
+
+  return sha256Hex(canonicalJsonStringify(def));
+}
+
 // Compute + persist represented_map on FIRST close.
 // Returns { ok, represented_map, represented_map_hash } or null if not applicable.
 function computeRepresentedMapSnapshotIfNeeded(db, poll) {
@@ -1736,6 +1763,22 @@ app.get("/api/polls", (req, res) => {
       } catch (_) {
         // fail-closed: don't block poll listing
       }
+
+      // Poll definition fingerprint (canonical, meaning-bearing)
+      try {
+        // Ensure poll_fingerprint exists (definition-level)
+        if (!p.poll_fingerprint) {
+          try {
+            p.poll_fingerprint = computePollFingerprint(p);
+            changedAny = true; // <-- REQUIRED so saveDB(db) happens
+          } catch (_) {
+            // fail-closed
+          }
+        }
+      } catch (_) {
+        // fail-closed: don't block poll listing
+      }
+
       // -------------------------------
       // Federation commitment injection
       // -------------------------------
@@ -1812,6 +1855,16 @@ app.get("/api/polls", (req, res) => {
 
           p.override_delta_hash = sha256Hex(canonicalJsonStringify(overridesForPoll));
           changedAny = true;
+        }
+        
+        // Ensure poll_fingerprint exists (definition-level; meaning-bearing)
+        if (!p.poll_fingerprint) {
+          try {
+            p.poll_fingerprint = computePollFingerprint(p);
+            changedAny = true;
+          } catch (_) {
+            // fail-closed
+          }
         }
 
         // Upsert local commitment (idempotent)
