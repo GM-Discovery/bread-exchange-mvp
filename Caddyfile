@@ -1,4 +1,4 @@
-exchange.breadstandard.com {
+{$DOMAIN} {
 	root * /srv/ui
 	file_server
 
