@@ -1,4 +1,4 @@
-{$DOMAIN} {
+{env.DOMAIN} {
 	root * /srv/ui
 	file_server
 
