@@ -22,8 +22,6 @@ services:
       - .env
     environment:
       - NODE_ENV=production
-      # OPERATOR_KEY is already in .env; keeping this is optional redundancy.
-      - OPERATOR_KEY=${OPERATOR_KEY}
     volumes:
       - ./data:/app/data
     expose:

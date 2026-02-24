@@ -1,0 +1,2755 @@
+// --- UI SHIP TRIPWIRE (static deploy guard) ---
+// If this exchange accidentally serves a dev/module build, fail loudly and abort init.
+function __uiStaticTripwireOrAbort() {
+  try {
+    const hasUiJs =
+      !!document.querySelector('script[src="/ui.js"], script[src="./ui.js"], script[src="ui.js"]');
+    const hasCss =
+      !!document.querySelector('link[href="/styles.css"], link[href="./styles.css"], link[href="styles.css"]');
+
+    const hasDevModule =
+      !!document.querySelector('script[type="module"][src*="/src/"]') ||
+      !!document.querySelector('script[src*="/src/main.js"]') ||
+      (document.documentElement && document.documentElement.innerHTML.includes("/src/main.js"));
+
+    if (!hasUiJs || !hasCss || hasDevModule) {
+      const msg =
+        "Wrong UI build detected (dev/module assets). This exchange expects static /ui.js. Fix deployment.";
+
+      const el = document.createElement("div");
+      el.setAttribute("data-ui-tripwire", "1");
+      el.style.cssText =
+        "padding:12px 14px;margin:10px 0;border:2px solid #b00020;background:#fff3f4;color:#1a1a1a;font:14px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;";
+      el.innerHTML =
+        "<b>" +
+        msg +
+        "</b><div style=\"margin-top:6px\">If you see this, HTML is pointing at <code>/src/*</code> or missing <code>/ui.js</code>/<code>/styles.css</code>.</div>";
+
+      if (document.body) document.body.insertBefore(el, document.body.firstChild);
+      console.error(msg);
+      return true; // abort
+    }
+  } catch (e) {
+    console.error("UI tripwire threw unexpectedly:", e);
+    return true; // fail-closed
+  }
+  return false; // proceed
+}
+// --- end UI SHIP TRIPWIRE ---
+
+(function () {
+  try {
+    let n = 0;
+    document.addEventListener("click", (e) => {
+      n++;
+      const t = e.target && e.target.id ? `#${e.target.id}` : (e.target && e.target.tagName ? e.target.tagName : "unknown");
+      console.log("UI_CLICK", n, t);
+
+      // Update / create a badge
+      let b = document.getElementById("uiClickMarker");
+      if (!b) {
+        b = document.createElement("div");
+        b.id = "uiClickMarker";
+        b.style.cssText = "position:fixed;bottom:8px;right:8px;z-index:999999;background:#111;color:#fff;padding:6px 10px;border-radius:8px;font:12px/1.2 system-ui;opacity:.9";
+        document.addEventListener("DOMContentLoaded", () => document.body.appendChild(b));
+        if (document.body) document.body.appendChild(b);
+      }
+      b.textContent = `Clicks seen: ${n} (${t})`;
+    }, true); // capture phase: sees clicks even if something stops bubbling
+  } catch (_) {}
+})();
+(function () {
+  try {
+    const d = document.createElement("div");
+    d.id = "uiBootMarker";
+    d.textContent = "UI JS loaded ✅";
+    d.style.cssText = "position:fixed;bottom:8px;left:8px;z-index:999999;background:#111;color:#fff;padding:6px 10px;border-radius:8px;font:12px/1.2 system-ui;opacity:.9";
+    document.addEventListener("DOMContentLoaded", () => document.body.appendChild(d));
+  } catch (_) {}
+})();
+window.addEventListener("error", (e) => {
+  try {
+    const d = document.createElement("div");
+    d.textContent = "UI ERROR: " + (e && e.message ? e.message : "unknown");
+    d.style.cssText = "position:fixed;bottom:44px;left:8px;z-index:999999;background:#8b0000;color:#fff;padding:6px 10px;border-radius:8px;font:12px/1.2 system-ui;opacity:.95";
+    document.body.appendChild(d);
+  } catch (_) {}
+});
+window.addEventListener("unhandledrejection", (e) => {
+  try {
+    const d = document.createElement("div");
+    d.textContent = "UI REJECTION: " + (e && e.reason ? String(e.reason) : "unknown");
+    d.style.cssText = "position:fixed;bottom:80px;left:8px;z-index:999999;background:#8b0000;color:#fff;padding:6px 10px;border-radius:8px;font:12px/1.2 system-ui;opacity:.95";
+    document.body.appendChild(d);
+  } catch (_) {}
+});
+(() => {
+  "use strict";
+
+// =========================
+// Admin Mode (session-only)
+// =========================
+// Operator key is kept ONLY in memory (never localStorage).
+let __adminEnabled = false;
+let __operatorKeyMem = "";
+
+function isAdminEnabled() { return !!__adminEnabled; }
+function setOperatorKeyMem(k) { __operatorKeyMem = String(k || "").trim(); }
+function getOperatorKeyMemOrNull() { return __operatorKeyMem ? __operatorKeyMem : null; }
+
+function setAdminEnabled(enabled) {
+  __adminEnabled = !!enabled;
+
+  // Toggle admin-only UI
+  const adminOnly = document.getElementById("adminOnlySection");
+  if (adminOnly) adminOnly.style.display = __adminEnabled ? "block" : "none";
+
+  const btn = document.getElementById("adminToggleBtn");
+  if (btn) btn.textContent = __adminEnabled ? "Disable Admin Mode" : "Enable Admin Mode";
+
+  const status = document.getElementById("adminStatus");
+  if (status) status.textContent = __adminEnabled ? "Admin mode enabled." : "Admin mode inactive.";
+}
+
+  // =========================
+  // Storage keys
+  // =========================
+  const LS_API = "breadpoll_api";
+  const LS_TOKENS = "breadpoll_tokens"; // poll_id -> voter_token (device-local)
+  const LS_LOCAL_POLLS = "breadpoll_local_polls_v1"; // array of poll objects
+  const LS_LOCAL_VOTES = "breadpoll_local_votes_v1"; // poll_id -> { byToken: {token: choice}, counts: {option: n} }
+  const LS_REMOTE_LAST_CHOICE = "breadpoll_remote_last_choice_v1"; // poll_id -> last chosen label (UI hint only)
+  const LS_VOTE_SESSION = "breadpoll_vote_session_v0"; // poll_id -> { last_known_has_vote, stranded_reason, last_error_code }
+
+  // =========================
+  // API base selection (optional)
+  // =========================
+  
+  const params = new URLSearchParams(location.search);
+  const apiOverride = params.get("api");
+
+  function defaultApiBase() {
+    // Default to same-origin Exchange API so operators can host UI + API together.
+    // Example: https://exchange.example.com/api
+    return window.location.origin.replace(/\\\/$/, "") + "/api";
+  }
+
+  let API = apiOverride || localStorage.getItem(LS_API) || defaultApiBase();
+  const EXCHANGE_API = API; // Canonical: all exchange calls use same-origin /api by default
+
+// Back-compat: some older code paths used EXCHANGE_API.
+// Keep it aligned to the effective API base.
+
+  // =========================
+  // Runtime state
+  // =========================
+  let es = null; // EventSource (remote live stream only)
+  let currentPollId = null;
+  let quill = null; // optional Quill instance
+  let currentTab = "create";   // "create" | "polls" | "settings"
+  let inPollDetail = false;   // true when viewing a single poll
+
+
+  // =========================
+  // UX guard: disable buttons while network calls are in-flight
+  // =========================
+  function setUiBusy(isBusy, statusTextOrNull) {
+    const ids = [
+      "createPoll",
+      "refreshPolls",
+      "assertBtn",
+      "createIdentityBtn",
+      "copyIdentityBackupBtn",      "clearStampsBtn",
+      "delegationSetBtn",
+      "delegationRevokeBtn",
+    ];
+    for (const id of ids) {
+      const el = document.getElementById(id);
+      if (el) el.disabled = !!isBusy;
+    }
+
+    // Vote buttons are dynamic children; disable them too.
+    const vb = document.getElementById("voteButtons");
+    if (vb) {
+      Array.from(vb.querySelectorAll("button")).forEach(b => { b.disabled = !!isBusy; });
+    }
+
+    // Optional: write status to voteOut (used for in-flight messaging)
+    if (statusTextOrNull != null) {
+      const voteOut = document.getElementById("voteOut");
+      if (voteOut) voteOut.textContent = String(statusTextOrNull);
+    }
+  }
+
+  // =========================
+  // HMAC signing (Web Crypto)
+  // =========================
+
+  function bytesToHex(bytes) {
+    return Array.from(bytes).map(b => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  function hexToBytes(hex) {
+    const clean = String(hex || "").trim();
+    if (!/^[0-9a-fA-F]+$/.test(clean) || clean.length % 2 !== 0) return null;
+    const out = new Uint8Array(clean.length / 2);
+    for (let i = 0; i < out.length; i++) {
+      out[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
+    }
+    return out;
+  }
+
+  async function sha256Hex(text) {
+    const enc = new TextEncoder();
+    const buf = await crypto.subtle.digest("SHA-256", enc.encode(text));
+    return bytesToHex(new Uint8Array(buf));
+  }
+
+  function makeNonceHex(byteLen = 12) {
+    const b = new Uint8Array(byteLen);
+    crypto.getRandomValues(b);
+    return bytesToHex(b);
+  }
+
+  async function hmacSha256Hex(keyHex, message) {
+    const keyBytes = hexToBytes(keyHex);
+    if (!keyBytes) throw new Error("Signing key must be hex (even length).");
+    const cryptoKey = await crypto.subtle.importKey(
+      "raw",
+      keyBytes,
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"]
+    );
+    const enc = new TextEncoder();
+    const sigBuf = await crypto.subtle.sign("HMAC", cryptoKey, enc.encode(message));
+    return bytesToHex(new Uint8Array(sigBuf));
+  }
+
+  async function buildHmacHeaders(method, path, bodyObjOrNull) {
+    const creds = getExchangeHmacCredsOrNull();
+    if (!creds) throw new Error("Missing Exchange identity (self_id / signing_key).");
+
+    const ts = String(Date.now()); // unix ms
+    const nonce = makeNonceHex(12);
+
+    const bodyText = bodyObjOrNull == null ? "" : JSON.stringify(bodyObjOrNull);
+    const bodyHash = await sha256Hex(bodyText);
+
+    const base =
+      String(method).toUpperCase() + "\n" +
+      String(path) + "\n" +
+      ts + "\n" +
+      nonce + "\n" +
+      bodyHash;
+
+    const sigHex = await hmacSha256Hex(creds.signing_key, base);
+
+    return {
+      "X-Self-ID": creds.self_id,
+      "X-Timestamp": ts,
+      "X-Nonce": nonce,
+      "X-Signature": sigHex,
+    };
+  }
+
+  // Fetch helper for Exchange endpoints that require HMAC.
+  // path is like "/stamp" (we will prefix EXCHANGE_API)
+  async function exchangeFetchAuthed(path, opts) {
+    const method = (opts?.method || "GET").toUpperCase();
+    const bodyObj = (opts && "body" in opts) ? opts.body : null;
+
+    const apiPrefix = new URL(EXCHANGE_API).pathname.replace(/\/$/, ""); // e.g. "/api"
+    const signPath = `${apiPrefix}${path}`; // e.g. "/api/stamp"
+    const h = await buildHmacHeaders(method, signPath, bodyObj);
+
+    const headers = {
+      "Content-Type": "application/json",
+      ...(opts?.headers || {}),
+      ...h,
+    };
+    
+    console.log("[exchangeFetchAuthed]", method, `${EXCHANGE_API}${path}`, "signPath=", signPath);
+
+    return fetch(`${EXCHANGE_API}${path}`, {
+      method,
+      headers,
+      body: bodyObj == null ? undefined : JSON.stringify(bodyObj),
+    });
+  }
+
+
+  // =========================
+  // Identity summary (trust visibility)
+  // =========================
+  async function exchangeFetchIdentitySummaryOrNull() {
+    try {
+      const r = await exchangeFetchAuthed("/identity/summary", { method: "GET" });
+      if (!r.ok) {
+        // Missing identity, bad signature, etc.
+        return null;
+      }
+      const j = await r.json().catch(() => null);
+      if (!j || j.ok !== true) return null;
+      return j;
+    } catch (_e) {
+      return null;
+    }
+  }
+
+  function setIdentityAliasUi(aliasOrNull) {
+    const aliasEl = document.getElementById("identityPublicAlias");
+    if (aliasEl) aliasEl.value = aliasOrNull ? String(aliasOrNull) : "";
+  }
+
+  async function refreshTrustVisibilityUi(statusElOrNull) {
+    const tp = document.getElementById("statTrustPoints");
+    const et = document.getElementById("statEarnedTrust");
+    const dt = document.getElementById("statDelegatedTrust");
+
+    const hasIdentity = !!getExchangeHmacCredsOrNull();
+    if (!hasIdentity) {
+      setIdentityAliasUi("");
+      if (tp) tp.textContent = "—";
+      if (et) et.textContent = "—";
+      if (dt) dt.textContent = "—";
+      if (statusElOrNull) statusElOrNull.textContent = "No identity on this device.";
+      return;
+    }
+
+    if (statusElOrNull) statusElOrNull.textContent = "Fetching trust summary…";
+    const s = await exchangeFetchIdentitySummaryOrNull();
+    if (!s) {
+      // Keep existing UI, but make failure legible.
+      if (statusElOrNull) statusElOrNull.textContent = "Could not fetch trust summary (signed).";
+      return;
+    }
+
+    // public_alias is safe to show; store locally as convenience.
+    if (s.public_alias) {
+      localStorage.setItem("exchange_public_alias", String(s.public_alias));
+      setIdentityAliasUi(String(s.public_alias));
+    }
+
+    // UI convention: TRUST POINTS shows combined available.
+    if (tp) tp.textContent = String(s.combined_available ?? "—");
+    if (et) et.textContent = String(s.earned_personal ?? "—");
+    if (dt) dt.textContent = String(s.inbound_delegated ?? "—");
+
+    if (statusElOrNull) statusElOrNull.textContent = "Trust summary updated.";
+  }
+
+  // =========================
+  // Identity create (PoW-lite)
+  // =========================
+
+  async function exchangeGetIdentityChallenge() {
+    const r = await fetch(`${EXCHANGE_API}/identity/challenge`, { method: "GET" });
+    if (!r.ok) {
+      const t = await r.text().catch(() => "");
+      throw new Error(`Challenge failed (${r.status}). ${t}`);
+    }
+    return r.json(); // expected: { challenge, difficulty }
+  }
+
+  async function solvePowLite(challenge, difficulty) {
+    // Goal: find nonce such that sha256(challenge + ":" + nonce) has N leading zeros (hex).
+    // This is intentionally simple and auditable. Difficulty should be low for MVP.
+    const targetPrefix = "0".repeat(Math.max(0, Number(difficulty) || 0));
+
+    let nonce = 0;
+    while (true) {
+      const candidate = String(nonce);
+      const h = await sha256Hex(`${challenge}:${candidate}`);
+      if (h.startsWith(targetPrefix)) return candidate;
+      nonce++;
+      // Yield occasionally so UI doesn't feel frozen
+      if (nonce % 500 === 0) await new Promise(r => setTimeout(r, 0));
+    }
+  }
+
+  async function exchangeCreateIdentityWithPow(statusEl) {
+    if (statusEl) statusEl.textContent = "Requesting challenge…";
+
+    const { challenge, difficulty } = await exchangeGetIdentityChallenge();
+
+    if (statusEl) statusEl.textContent = `Solving proof-of-work (difficulty ${difficulty})…`;
+
+    const nonce = await solvePowLite(challenge, difficulty);
+
+    if (statusEl) statusEl.textContent = "Creating identity…";
+
+    const r = await fetch(`${EXCHANGE_API}/identity/create`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ challenge, nonce }),
+    });
+
+    const raw = await r.text().catch(() => "");
+    if (!r.ok) throw new Error(`Identity create failed (${r.status}). ${raw}`);
+
+    let data = null;
+    try { data = JSON.parse(raw); } catch { data = null; }
+    if (!data?.self_id || !data?.signing_key) {
+      throw new Error("Identity create returned unexpected payload (missing self_id/signing_key).");
+    }
+
+    // Store locally (do not log)
+    localStorage.setItem(LS_EXCHANGE_SELF_ID, String(data.self_id));
+    localStorage.setItem(LS_EXCHANGE_SIGNING_KEY, String(data.signing_key));
+    if (data.public_alias) localStorage.setItem(LS_EXCHANGE_PUBLIC_ALIAS, String(data.public_alias));
+
+    return data; // { self_id, signing_key, public_alias? }
+  }
+
+  async function copyTextToClipboardOrThrow(text) {
+    // Tauri + modern browsers should support navigator.clipboard in secure contexts.
+    // If clipboard fails, we throw and show a user-facing message.
+    if (!navigator.clipboard?.writeText) throw new Error("Clipboard not available.");
+    await navigator.clipboard.writeText(String(text));
+  }
+
+  // --- Exchange Stamp storage keys ---
+  const LS_EXCHANGE_STAMPS = "exchange_stamps";
+  const LS_EXCHANGE_PERSONA_ID = "exchange_persona_id";
+
+  // Read the local stamp pool (array of strings)
+  function getExchangeStampPool() {
+    try {
+      const raw = localStorage.getItem(LS_EXCHANGE_STAMPS);
+      const arr = raw ? JSON.parse(raw) : [];
+      return Array.isArray(arr) ? arr.filter(Boolean) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  // Save stamps (ephemeral model: keep pool size = 1).
+  // We never show stamp tokens in the UI; this is internal-only.
+  function addStampsToPool(newStamps) {
+    const arr = Array.isArray(newStamps) ? newStamps : [];
+    const chosen = arr.find(s => (typeof s === "string") && s.startsWith("s_")) || null;
+    if (!chosen) return;
+
+    // Pool size = 1 (simplifies lifecycle: mint on-demand, no "collecting").
+    localStorage.setItem(LS_EXCHANGE_STAMPS, JSON.stringify([chosen]));
+  }
+
+  // Pick one stamp (random) for later use (voting, future)
+  function pickOneStampOrNull() {
+    const pool = getExchangeStampPool();
+    if (!pool.length) return null;
+    return pool[Math.floor(Math.random() * pool.length)];
+  }
+
+  let currentPollApiBase = null; // "https://…/api" for the currently open poll
+
+  // =========================
+  // Helpers: tokens
+  // =========================
+  function getTokens() {
+    try {
+      return JSON.parse(localStorage.getItem(LS_TOKENS) || "{}");
+    } catch (e) {
+      return {};
+    }
+  }
+
+  function setToken(pollId, token) {
+    const t = getTokens();
+    t[pollId] = token;
+    localStorage.setItem(LS_TOKENS, JSON.stringify(t));
+  }
+
+  function getToken(pollId) {
+    const t = getTokens();
+    return t[pollId] || null;
+  }
+
+  function clearToken(pollId) {
+    const t = getTokens();
+    if (t && Object.prototype.hasOwnProperty.call(t, pollId)) {
+      delete t[pollId];
+      localStorage.setItem(LS_TOKENS, JSON.stringify(t));
+    }
+  }
+
+  function ensureLocalToken(pollId) {
+    let tok = getToken(pollId);
+    if (!tok) {
+      tok = "localtok_" + makeId();
+      setToken(pollId, tok);
+    }
+    return tok;
+  }
+
+  // =========================
+  // Helpers: local polls
+  // =========================
+  function loadLocalPolls() {
+    try {
+      return JSON.parse(localStorage.getItem(LS_LOCAL_POLLS) || "[]");
+    } catch (e) {
+      return [];
+    }
+  }
+
+  function saveLocalPolls(polls) {
+    localStorage.setItem(LS_LOCAL_POLLS, JSON.stringify(polls));
+  }
+
+  function addLocalPoll(p) {
+    const polls = loadLocalPolls();
+    polls.unshift(p);
+    saveLocalPolls(polls);
+  }
+
+  function removeLocalPoll(id) {
+    const polls = loadLocalPolls();
+    const next = polls.filter(p => p.id !== id);
+    saveLocalPolls(next);
+  }
+
+  function getLocalPoll(id) {
+    const polls = loadLocalPolls();
+    return polls.find(p => p.id === id) || null;
+  }
+
+  // =========================
+  // Helpers: local votes/results
+  // =========================
+  function loadLocalVotesAll() {
+    try {
+      return JSON.parse(localStorage.getItem(LS_LOCAL_VOTES) || "{}");
+    } catch (e) {
+      return {};
+    }
+  }
+
+  function saveLocalVotesAll(obj) {
+    localStorage.setItem(LS_LOCAL_VOTES, JSON.stringify(obj));
+  }
+
+  function getLocalVoteState(pollId, options) {
+    const all = loadLocalVotesAll();
+    const st = all[pollId] || { byToken: {}, counts: {} };
+
+    // Ensure counts keys exist for current options
+    const counts = st.counts || {};
+    (options || []).forEach(opt => {
+      if (typeof counts[opt] !== "number") counts[opt] = 0;
+    });
+
+    st.counts = counts;
+    all[pollId] = st;
+    saveLocalVotesAll(all);
+
+    return st;
+  }
+ 
+  function clearExchangeStampPool() {
+    localStorage.removeItem("exchange_stamps");
+    localStorage.removeItem("exchange_persona_id");
+  }
+
+  function setLocalVote(pollId, token, choice, options) {
+    const all = loadLocalVotesAll();
+    const st = all[pollId] || { byToken: {}, counts: {} };
+
+    st.byToken = st.byToken || {};
+    st.counts = st.counts || {};
+
+    // Initialize counts for options
+    (options || []).forEach(opt => {
+      if (typeof st.counts[opt] !== "number") st.counts[opt] = 0;
+    });
+
+    const prev = st.byToken[token];
+
+    // If changing vote, decrement old choice
+    if (prev && typeof st.counts[prev] === "number") {
+      st.counts[prev] = Math.max(0, st.counts[prev] - 1);
+    }
+
+    // Set new
+    st.byToken[token] = choice;
+    if (typeof st.counts[choice] !== "number") st.counts[choice] = 0;
+    st.counts[choice] += 1;
+
+    all[pollId] = st;
+    saveLocalVotesAll(all);
+  }
+
+  function buildLocalResults(poll) {
+    const st = getLocalVoteState(poll.id, poll.options || []);
+    const counts = st.counts || {};
+    const total = Object.values(counts).reduce((a, b) => a + (Number(b) || 0), 0);
+
+    return {
+      poll_id: poll.id,
+      total_votes: total,
+      counts: counts,
+    };
+  }
+ 
+  // =========================
+  // Helpers: remote "sticky vote" (UI hint only)
+  // =========================
+  function getRemoteLastChoiceMap() {
+    try {
+      return JSON.parse(localStorage.getItem(LS_REMOTE_LAST_CHOICE) || "{}");
+    } catch {
+      return {};
+    }
+  }
+
+  function setRemoteLastChoice(pollId, label) {
+    const m = getRemoteLastChoiceMap();
+    m[String(pollId)] = String(label || "");
+    localStorage.setItem(LS_REMOTE_LAST_CHOICE, JSON.stringify(m));
+  }
+
+  function getRemoteLastChoice(pollId) {
+    const m = getRemoteLastChoiceMap();
+    const v = m[String(pollId)];
+    return v ? String(v) : null;
+  }
+
+
+  // =========================
+  // Helpers: vote session (authoritative-ish UI state)
+  // - Stores ONLY UI hints + last-known Exchange truth we learned.
+  // - Does NOT change Exchange state.
+  // =========================
+  function getVoteSessionMap() {
+    try { return JSON.parse(localStorage.getItem(LS_VOTE_SESSION) || "{}"); }
+    catch { return {}; }
+  }
+
+  function getVoteSession(pollId) {
+    const m = getVoteSessionMap();
+    const rec = m[String(pollId)] || {};
+    return {
+      last_known_has_vote: rec.last_known_has_vote === true,
+      stranded_reason: rec.stranded_reason || null, // "missing_token" | "invalid_token" | null
+      last_error_code: rec.last_error_code || null,
+      last_checked_at_ms: Number(rec.last_checked_at_ms || 0) || 0,
+    };
+  }
+
+  function patchVoteSession(pollId, patch) {
+    const id = String(pollId);
+    const m = getVoteSessionMap();
+    const prev = (m[id] && typeof m[id] === "object") ? m[id] : {};
+    const next = { ...prev, ...(patch || {}) };
+    m[id] = next;
+    localStorage.setItem(LS_VOTE_SESSION, JSON.stringify(m));
+    return next;
+  }
+
+  function clearVoteSession(pollId) {
+    const id = String(pollId);
+    const m = getVoteSessionMap();
+    if (Object.prototype.hasOwnProperty.call(m, id)) {
+      delete m[id];
+      localStorage.setItem(LS_VOTE_SESSION, JSON.stringify(m));
+    }
+  }
+
+  // =========================
+  // Poll status banner (minimal UI surface)
+  // =========================
+  function setPollStatus(code, messageOrNull) {
+    const banner = document.getElementById("pollStatusBanner");
+    const text = document.getElementById("pollStatusText");
+
+    if (!banner || !text) return;
+
+    if (!code) {
+      banner.style.display = "none";
+      text.textContent = "";
+      return;
+    }
+
+    banner.style.display = "block";
+    text.textContent = String(messageOrNull || "");
+  }
+
+  function markStranded(pollId, reason) {
+    patchVoteSession(pollId, {
+      stranded_reason: String(reason || "missing_token"),
+      last_error_code: (reason === "invalid_token") ? "STRANDED_INVALID_TOKEN" : "STRANDED_MISSING_TOKEN",
+    });
+
+    setPollStatus(
+      (reason === "invalid_token") ? "STRANDED_INVALID_TOKEN" : "STRANDED_MISSING_TOKEN",
+      "Exchange confirms you’ve voted. This device can’t change that vote because it doesn’t have your revote token. You can still view results. To change your vote, use the device that originally voted, or rebind (future)."
+    );
+  }
+
+  function clearStrandedUi(pollId) {
+    patchVoteSession(pollId, { stranded_reason: null, last_error_code: null });
+    setPollStatus(null, null);
+  }
+
+  function clearLocalVoteHintOnly(pollId, pollObjOrNull) {
+    const m = getRemoteLastChoiceMap();
+    delete m[String(pollId)];
+    localStorage.setItem(LS_REMOTE_LAST_CHOICE, JSON.stringify(m));
+
+    const vb = document.getElementById("voteButtons");
+    if (vb && pollObjOrNull) renderVoteButtons(vb, pollObjOrNull, null);
+  }
+
+  // =========================
+  // Helpers: local vote lookup (for assert carry-forward)
+  // =========================
+  function getLocalSelectedChoice(poll) {
+    if (!poll?.id) return null;
+    const token = ensureLocalToken(poll.id);
+    const all = loadLocalVotesAll();
+    const st = all[poll.id];
+    const choice = st?.byToken?.[token];
+    return choice ? String(choice) : null;
+  }
+
+  // =========================
+  // Helpers: purge local poll + local vote reality after assert
+  // =========================
+  function purgeLocalPollState(localPollId) {
+    const id = String(localPollId || "");
+    if (!id) return;
+
+    // 1) Remove poll itself
+    try { removeLocalPoll(id); } catch {}
+
+    // 2) Remove local votes/results for that poll
+    try {
+      const allVotes = loadLocalVotesAll();
+      if (allVotes && typeof allVotes === "object") {
+        delete allVotes[id];
+        saveLocalVotesAll(allVotes);
+      }
+    } catch {}
+
+    // 3) Remove token entry (local voter_token)
+    try {
+      const t = getTokens();
+      if (t && typeof t === "object") {
+        delete t[id];
+        localStorage.setItem(LS_TOKENS, JSON.stringify(t));
+      }
+    } catch {}
+  }
+
+  // =========================
+  // UI: render vote buttons with selected state
+  // =========================
+  function renderVoteButtons(containerEl, poll, selectedLabel) {
+    if (!containerEl) return;
+    containerEl.innerHTML = "";
+
+    const opts = (poll?.options || []);
+    for (const opt of opts) {
+      const label = opt?.label ?? opt;
+      const b = document.createElement("button");
+      b.type = "button";
+      b.textContent = label;
+
+      // Visual selection (uses existing CSS classes)
+      if (selectedLabel && String(label) === String(selectedLabel)) {
+        b.className = "btn-primary";
+      } else {
+        b.className = "btn-ghost";
+      }
+
+      b.onclick = () => castVote(poll, label);
+      containerEl.appendChild(b);
+    }
+  }
+
+  // =========================
+  // Exchange: vote by label (used by Assert carry-forward)
+  // =========================
+  async function castExchangeVoteByLabel(poll, choiceLabel, statusEl) {
+    // Used for "carry-forward" during assert.
+    // Important: keep this function UI-safe (no stamp token output).
+    const pollId = poll?.id;
+    if (!pollId) return { ok: false, error: "missing poll id" };
+
+    // Map label -> option_id
+    const opts = (poll.options || []);
+    const idx = opts.findIndex(o => (o?.label ?? o) === choiceLabel);
+    if (idx < 0) {
+      if (statusEl) statusEl.textContent = "Vote carry failed (bad option). Poll is live.";
+      return { ok: false, error: "bad option" };
+    }
+
+    const optObj = opts[idx];
+    const option_id = (optObj && typeof optObj === "object" && optObj.id != null)
+      ? String(optObj.id)
+      : String(idx + 1);
+
+    if (statusEl) statusEl.textContent = "Casting vote on Exchange…";
+
+    const res = await exchangeVoteWithRetry(poll, String(pollId), option_id, choiceLabel, statusEl, { allowStamp: true });
+
+    if (!res?.ok) {
+      if (statusEl) statusEl.textContent = "Poll live; vote not cast yet.";
+      return { ok: false, error: res?.error || "vote failed" };
+    }
+
+    // After a successful carry-forward vote, refresh results once so the UI is unambiguous.
+    try { await fetchRemoteResultsOnceAndRender(poll, pollId); } catch {}
+
+    return { ok: true };
+  }
+
+
+  // =========================
+  // Exchange Identity (HMAC client creds stored locally)
+  // =========================
+  const LS_EXCHANGE_SELF_ID = "exchange_self_id";
+  const LS_EXCHANGE_SIGNING_KEY = "exchange_signing_key";
+  const LS_EXCHANGE_PUBLIC_ALIAS = "exchange_public_alias";
+
+  function getExchangeSelfIdOrNull() {
+    const v = (localStorage.getItem(LS_EXCHANGE_SELF_ID) || "").trim();
+    return v || null;
+  }
+
+// =========================
+// Local Labels (per-identity, local-only)
+// =========================
+// These are NOT canonical identity claims. They are convenience labels stored on this device,
+// scoped to the current exchange identity (self_id) so multiple identities on one device
+// do not bleed labels into each other.
+function getAliasLabelStoreKeyOrNull() {
+  const self_id = getExchangeSelfIdOrNull();
+  if (!self_id) return null;
+  return `alias_labels_v0::${String(self_id)}`;
+}
+
+function loadAliasLabelsMap() {
+  const k = getAliasLabelStoreKeyOrNull();
+  if (!k) return {};
+  try {
+    const raw = localStorage.getItem(k);
+    if (!raw) return {};
+    const obj = JSON.parse(raw);
+    return (obj && typeof obj === "object") ? obj : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveAliasLabelsMap(map) {
+  const k = getAliasLabelStoreKeyOrNull();
+  if (!k) return;
+  try {
+    localStorage.setItem(k, JSON.stringify(map || {}));
+  } catch {
+    // ignore quota / storage failures
+  }
+}
+
+function getAliasLabelOrNull(public_alias) {
+  if (!public_alias) return null;
+  const m = loadAliasLabelsMap();
+  const v = m[String(public_alias)];
+  return (typeof v === "string" && v.trim()) ? v.trim() : null;
+}
+
+function setAliasLabel(public_alias, labelOrNull) {
+  if (!public_alias) return;
+  const m = loadAliasLabelsMap();
+  const k = String(public_alias);
+
+  const v = (labelOrNull == null) ? "" : String(labelOrNull).trim();
+  if (!v) delete m[k];
+  else m[k] = v;
+
+  saveAliasLabelsMap(m);
+}
+
+  function getExchangeSigningKeyOrNull() {
+    const v = (localStorage.getItem(LS_EXCHANGE_SIGNING_KEY) || "").trim();
+    return v || null;
+  }
+
+  function getExchangeAliasOrNull() {
+    const v = (localStorage.getItem(LS_EXCHANGE_PUBLIC_ALIAS) || "").trim();
+    return v || null;
+  }
+
+  function getExchangeHmacCredsOrNull() {
+    const self_id = getExchangeSelfIdOrNull();
+    const signing_key = getExchangeSigningKeyOrNull();
+    if (!self_id || !signing_key) return null;
+    return { self_id, signing_key };
+  }
+
+  // UI helpers
+  // =========================
+  // Results normalization + rendering (Weighted-first)
+  // =========================
+
+  function normalizeResults(obj) {
+    const raw = obj || {};
+
+    // Some callers pass { poll_id, results: {...} }
+    const r = raw.results && typeof raw.results === "object" ? raw.results : raw;
+
+    // totals: prefer totals, else counts (and allow nested variants)
+    const totals =
+      (r && r.totals && typeof r.totals === "object") ? r.totals :
+      (r && r.counts && typeof r.counts === "object") ? r.counts :
+      (raw && raw.totals && typeof raw.totals === "object") ? raw.totals :
+      (raw && raw.counts && typeof raw.counts === "object") ? raw.counts :
+      {};
+
+    const people_voted =
+      (typeof r.people_voted === "number") ? r.people_voted :
+      (typeof raw.people_voted === "number") ? raw.people_voted :
+      null;
+
+    const total_votes =
+      (typeof r.total_votes === "number") ? r.total_votes :
+      (typeof raw.total_votes === "number") ? raw.total_votes :
+      null;
+
+    const weights_used =
+      (r.weights_used && typeof r.weights_used === "object") ? r.weights_used :
+      (raw.weights_used && typeof raw.weights_used === "object") ? raw.weights_used :
+      null;
+
+    const validated =
+      (typeof r.validated === "boolean") ? r.validated :
+      (typeof raw.validated === "boolean") ? raw.validated :
+      null;
+
+    // represented weight: prefer weights_used.sum, else represented_people, else sum(totals)
+    let represented_weight = null;
+
+    if (weights_used && typeof weights_used.sum === "number") {
+      represented_weight = weights_used.sum;
+    } else if (typeof r.represented_people === "number") {
+      represented_weight = r.represented_people;
+    } else if (typeof raw.represented_people === "number") {
+      represented_weight = raw.represented_people;
+    } else {
+      represented_weight = Object.values(totals).reduce((a, b) => a + (Number(b) || 0), 0);
+    }
+
+    return {
+      totals,
+      people_voted,
+      represented_weight,
+      total_votes,
+      validated,
+      weights_used,
+      raw,
+    };
+  }
+
+  function renderPrettyResults(poll, normalized) {
+    const rowsEl = document.getElementById("resultsRows");
+    const representedEl = document.getElementById("resultsRepresented");
+    const peopleEl = document.getElementById("resultsPeople");
+    const ballotsEl = document.getElementById("resultsBallots");
+    const validatedEl = document.getElementById("resultsValidated");
+    const resultsBox = document.getElementById("resultsBox");
+    const localWarnEl = document.getElementById("resultsLocalWarn");
+    // Show a loud warning when this poll is local-only (not on Exchange).
+    // We treat a poll as local if poll.is_local is true OR id starts with "local_".
+    const isLocalOnly = !!poll?.is_local || String(poll?.id || "").startsWith("local_");
+    if (localWarnEl) localWarnEl.style.display = isLocalOnly ? "inline-flex" : "none";
+
+
+    if (!poll || !normalized) return;
+
+    // Keep audit JSON always available
+    if (resultsBox) {
+      try { resultsBox.textContent = JSON.stringify(normalized.raw, null, 2); }
+      catch { resultsBox.textContent = String(normalized.raw || ""); }
+    }
+
+    const totals = normalized.totals || {};
+
+    // Build option map: id -> label
+    // Remote: options are objects {id,label}
+    // Local: options are strings ["Yes","No"] (no ids), so we map "1..N"
+    const optMap = {};
+    const opts = Array.isArray(poll.options) ? poll.options : [];
+
+    const optionsAreObjects = opts.length && typeof opts[0] === "object";
+    if (optionsAreObjects) {
+      for (const o of opts) {
+        const id = (o && o.id != null) ? String(o.id) : "";
+        const label = (o && o.label != null) ? String(o.label) : "";
+        if (id) optMap[id] = label || `Option ${id}`;
+      }
+    } else {
+      for (let i = 0; i < opts.length; i++) {
+        optMap[String(i + 1)] = String(opts[i]);
+      }
+    }
+
+    // Ensure we include any totals keys even if option list is missing
+    for (const k of Object.keys(totals)) {
+      if (!optMap[k]) optMap[k] = `Option ${k}`;
+    }
+
+    const sumWeight = Object.values(totals).reduce((a, b) => a + (Number(b) || 0), 0);
+
+    // Headline numbers
+    if (representedEl) representedEl.textContent =
+      (normalized.represented_weight == null) ? "—" : String(normalized.represented_weight);
+
+    if (peopleEl) peopleEl.textContent =
+      (normalized.people_voted == null) ? "—" : String(normalized.people_voted);
+
+    if (ballotsEl) ballotsEl.textContent =
+      (normalized.total_votes == null) ? "—" : String(normalized.total_votes);
+
+    if (validatedEl) {
+      if (normalized.validated === true) {
+        validatedEl.textContent = "Validated";
+        validatedEl.classList.remove("bad");
+        validatedEl.classList.add("ok");
+      } else if (normalized.validated === false) {
+        validatedEl.textContent = "Not validated";
+        validatedEl.classList.remove("ok");
+        validatedEl.classList.add("bad");
+      } else {
+        validatedEl.textContent = "";
+        validatedEl.classList.remove("ok");
+        validatedEl.classList.remove("bad");
+      }
+    }
+
+    // Rows
+    if (!rowsEl) return;
+    rowsEl.innerHTML = "";
+
+    if (sumWeight <= 0) {
+      const div = document.createElement("div");
+      div.className = "muted";
+      div.style.textAlign = "center";
+      div.style.padding = "10px 0";
+      div.textContent = "No votes yet.";
+      rowsEl.appendChild(div);
+      return;
+    }
+
+    // Render in option order (1..N for local; poll order for remote)
+    const idsInOrder = optionsAreObjects
+      ? opts.map(o => String(o.id))
+      : opts.map((_, i) => String(i + 1));
+
+    // Also include any totals-only ids not in the option list
+    for (const k of Object.keys(totals)) {
+      if (!idsInOrder.includes(k)) idsInOrder.push(k);
+    }
+
+    for (const id of idsInOrder) {
+      const w = Number(totals[id] || 0);
+      const pct = sumWeight > 0 ? (w / sumWeight) : 0;
+      const pctText = `${Math.round(pct * 100)}%`;
+
+      const row = document.createElement("div");
+      row.className = "resultRow";
+
+      row.innerHTML = `
+        <div class="resultRowTop">
+          <div class="resultLabel">${escapeHtml(optMap[id] || `Option ${id}`)}</div>
+          <div class="resultNums">
+            <span>${escapeHtml(String(w))}</span>
+            <span>•</span>
+            <span>${escapeHtml(pctText)}</span>
+          </div>
+        </div>
+        <div class="barTrack">
+          <div class="barFill" style="width:${Math.max(0, Math.min(100, pct * 100)).toFixed(2)}%;"></div>
+        </div>
+      `;
+
+      rowsEl.appendChild(row);
+    }
+  }
+
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>\"']/g, m => ({
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      "\"": "&quot;",
+      "'": "&#039;",
+    }[m]));
+  }
+
+  function makeId() {
+    if (crypto && typeof crypto.randomUUID === "function") return crypto.randomUUID();
+    return String(Date.now()) + "_" + Math.random().toString(16).slice(2);
+  }
+
+  function closeStream() {
+    if (es) {
+      try { es.close(); } catch {}
+    }
+    es = null;
+  }
+
+  function showApiCardIfNeeded() {
+    const apiCard = document.getElementById("apiCard");
+    if (!apiCard) return;
+    if (params.get("settings") === "1") apiCard.style.display = "block";
+  }
+
+  async function ping() {
+    const apiStatus = document.getElementById("apiStatus");
+    try {
+      const r = await fetch(`${API}/health`, { cache: "no-store" });
+      if (!r.ok) throw new Error(String(r.status));
+      if (apiStatus) apiStatus.textContent = "Connected.";
+      return true;
+    } catch (e) {
+      if (apiStatus) apiStatus.textContent = "Not connected.";
+      return false;
+    }
+  }
+
+  // =========================
+  // Quill (optional)
+  // =========================
+  function initQuestionEditor() {
+    const el = document.getElementById("questionEditor");
+    if (!el) return null;
+
+    if (typeof window.Quill === "undefined") {
+      console.warn("Quill not loaded; editor disabled (safe).");
+      return null;
+    }
+
+    if (el.__quill_inited) return quill;
+    el.__quill_inited = true;
+
+    quill = new window.Quill(el, {
+      theme: "snow",
+      placeholder: "Write details here… (links, emphasis, lists)",
+      modules: {
+        toolbar: [
+          ["bold", "italic", "underline"],
+          [{ list: "ordered" }, { list: "bullet" }],
+          ["link"],
+          ["clean"],
+        ],
+      },
+    });
+
+    return quill;
+  }
+
+  // =========================
+  // Share / QR (optional)
+  // =========================
+  function pollLink(pollId) {
+    const url = new URL(window.location.href);
+    url.hash = `#poll=${encodeURIComponent(String(pollId))}`;
+    return url.toString();
+  }
+
+  async function copyToClipboard(text) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (e) {
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        ta.remove();
+        return true;
+      } catch (e) {
+        return false;
+      }
+    }
+  }
+
+  function openQr(link) {
+    const modal = document.getElementById("qrModal");
+    const qrBox = document.getElementById("qrBox");
+    const linkText = document.getElementById("qrLinkText");
+
+    if (linkText) linkText.textContent = link;
+    if (modal) modal.style.display = "block";
+    if (qrBox) qrBox.innerHTML = "";
+
+    if (typeof window.QRCode === "undefined") {
+      console.warn("QRCode library not loaded; showing link only.");
+      return;
+    }
+
+    try {
+      if (qrBox) new window.QRCode(qrBox, { text: link, width: 220, height: 220 });
+    } catch (e) {
+      console.log("QR render failed:", e);
+    }
+  }
+
+  async function fetchStampsFromExchange() {
+    // HMAC identity required to mint stamps on the Exchange
+    const creds = getExchangeHmacCredsOrNull();
+    if (!creds) throw new Error("Missing Exchange identity (self_id / signing_key).");
+
+    const r = await exchangeFetchAuthed("/stamp", {
+      method: "POST",
+      body: {}, // empty JSON object
+    });
+
+    const data = await r.json();
+
+    // Expected: { ok:true, issued:[...], issued_weights, issued_weight_combined, ... }
+    if (data && data.persona_id) localStorage.setItem(LS_EXCHANGE_PERSONA_ID, data.persona_id);
+    if (data && Array.isArray(data.issued) && data.issued.length) addStampsToPool(data.issued);
+    // Store "last computed" stats for Settings page (local-only)
+    try {
+      if (data?.issued_weight_combined != null) localStorage.setItem("exchange_last_weight_combined", String(data.issued_weight_combined));
+      if (data?.issued_weights && typeof data.issued_weights === "object") {
+        localStorage.setItem("exchange_last_issued_weights", JSON.stringify(data.issued_weights));
+      }
+      localStorage.setItem("exchange_last_stamp_ts", String(Date.now()));
+    } catch {}
+
+    return data;
+  }
+
+  // =========================
+  // Poll list rendering
+  // =========================
+  function renderPollList(polls) {
+    const list = document.getElementById("pollList");
+    const empty = document.getElementById("emptyState");
+    const q = (document.getElementById("search")?.value || "").trim().toLowerCase();
+
+    if (!list || !empty) return;
+
+    list.innerHTML = "";
+    empty.style.display = "block";
+    empty.textContent = "";
+
+    const filtered = q
+      ? polls.filter(p => (p.title || "").toLowerCase().includes(q))
+      : polls;
+
+    if (!filtered.length) {
+      empty.style.display = "block";
+      empty.textContent = "No local polls yet. Create one above.";
+      return;
+    }
+
+    empty.style.display = "none";
+
+    for (const p of filtered) {
+      const div = document.createElement("div");
+      const isClosed = !!(p.closed || p.is_closed || p.status === "CLOSED");
+      const badge = p.is_local ? "Local" : "Remote";
+
+      div.className = "list-item";
+      div.innerHTML = `
+        <div style="min-width:0;">
+          <div class="title" style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
+            ${escapeHtml(p.title || "(untitled)")}
+          </div>
+          <div class="meta">
+            <span>${escapeHtml(p.poll_type || "")}</span>
+            <span class="chip ${isClosed ? "closed" : "open"}">${isClosed ? "Closed" : "Open"}</span>
+            <span class="chip">${badge}</span>
+          </div>
+        </div>
+        <button class="btn-small btn-primary" type="button">Vote</button>
+      `;
+
+      const voteBtn = div.querySelector("button");
+      if (voteBtn) voteBtn.onclick = (e) => { e.stopPropagation(); openPoll(p); };
+      div.onclick = () => openPoll(p);
+
+      list.appendChild(div);
+    }
+  }
+
+  // =========================
+  // Refresh polls (Local-first; remote optional)
+  // =========================
+  async function refreshPolls() {
+    const local = loadLocalPolls().map(p => ({ ...p, is_local: true }));
+    renderPollList(local);
+
+    // Optional remote merge (never breaks local)
+    try {
+      const r = await fetch(`${EXCHANGE_API}/polls`, { cache: "no-store" });
+      if (!r.ok) return;
+      const remote = await r.json();
+      const remotePolls = remote?.polls;
+      if (!Array.isArray(remotePolls)) return;
+
+      const localIds = new Set(local.map(p => p.id));
+      const merged = [...local];
+
+      for (const p of remotePolls) {
+        if (!localIds.has(p.id)) merged.push({ ...p, is_local: false });
+      }
+
+      renderPollList(merged);
+    } catch (e) {
+      // ignore; local already shown
+    }
+  }
+
+  // =========================
+  // Open poll (Local-first)
+  // =========================
+  
+  function openFromHash() {
+    const m = /#poll=([^&]+)/.exec(window.location.hash || "");
+    if (!m) return;
+    const pollId = decodeURIComponent(m[1] || "");
+    if (!pollId) return;
+
+    const local = getLocalPoll(pollId);
+    if (local) {
+      openPoll({ ...local, is_local: true });
+    } else {
+      openPoll({ id: pollId, is_local: false });
+    }
+  }
+
+  async function openPoll(p) {
+    const pollId = p?.id;
+    if (!pollId) return;
+
+    const isLocal = !!p?.is_local || String(pollId).startsWith("local_");
+    currentPollApiBase = isLocal ? API : EXCHANGE_API;
+    currentPollId = pollId;
+    // Phase 1: poll drilldown replaces list view
+    const listCard = document.getElementById("pollsListCard");
+    if (listCard) listCard.style.display = "none";
+
+    const pollViewEl = document.getElementById("pollView");
+    if (pollViewEl) pollViewEl.style.display = "block";
+    // Ensure in Polls tab + show detail view
+    window.scrollTo(0, 0);
+    showTab("polls");
+    showPollDetail();
+    window.scrollTo(0, 0);
+
+    const pollView = document.getElementById("pollView");
+    const pollTitle = document.getElementById("pollTitle");
+    const pollMeta = document.getElementById("pollMeta");
+    const voteOut = document.getElementById("voteOut");
+    const resultsBox = document.getElementById("resultsBox");
+    const vb = document.getElementById("voteButtons");
+    const shareLinkEl = document.getElementById("shareLink");
+    const assertBtn = document.getElementById("assertBtn");
+    const assertOut = document.getElementById("assertOut");
+    if (shareLinkEl) {
+      const url = location.origin + location.pathname + "#poll=" + pollId;
+      shareLinkEl.href = url;
+      shareLinkEl.textContent = url;
+    }
+
+    if (pollView) pollView.style.display = "block";
+    if (voteOut) voteOut.textContent = "";
+    if (resultsBox) resultsBox.textContent = "";
+    if (vb) vb.innerHTML = "";
+    if (assertOut) assertOut.textContent = "";
+
+    let full = p;
+
+    if (isLocal) {
+      full = getLocalPoll(pollId) || p;
+      full.is_local = true;
+    } else {
+      // Remote best-effort: exchange doesn't support GET /api/polls/:id.
+      // We show a shell and let the SSE snapshot ("poll" event) fill in details.
+      full = { ...p, id: pollId, is_local: false };
+    }
+
+    const isLocalNow = !!full?.is_local || String(full?.id).startsWith("local_");
+
+    const pollTypeText = full?.poll_type ?? full?.meta?.poll_type ?? "";
+    if (pollTitle) pollTitle.textContent = (full && full.title) ? full.title : "(untitled)";
+    if (pollMeta) pollMeta.textContent = `${pollTypeText}${isLocalNow ? " • Local" : " • Remote"}`;
+
+    // Assertion-to-exchange UI (local drafts only)
+    if (assertBtn) {
+      assertBtn.style.display = isLocalNow ? "" : "none";
+      assertBtn.onclick = () => assertPollToExchange(full);
+    }
+
+    // Vote buttons (with selected state)
+    if (vb) {
+      const selected = isLocalNow ? getLocalSelectedChoice(full) : getRemoteLastChoice(pollId);
+      renderVoteButtons(vb, full, selected);
+    }
+
+    // Results display
+    closeStream();
+
+    if (isLocalNow) {
+      const res = buildLocalResults(full);
+      const norm = normalizeResults(res);
+      renderPrettyResults(full, norm);
+    } else {
+      // --- NEW: Remote poll hydration (do not rely on SSE) ---
+      // Exchange does not guarantee /stream exists (can 404), so we must fetch poll data once.
+      try {
+        const r = await fetch(`${EXCHANGE_API}/polls`, { method: "GET" });
+        if (r.ok) {
+          const data = await r.json();
+          const polls = Array.isArray(data?.polls) ? data.polls : [];
+          const found = polls.find(p => String(p?.id) === String(pollId));
+          if (found) {
+            full = { ...found, is_local: false };
+
+            if (pollTitle) pollTitle.textContent = full.title || "(untitled)";
+            const pt = full?.meta?.poll_type ?? full?.poll_type ?? "";
+            if (pollMeta) pollMeta.textContent = `${pt} • Remote`;
+
+            if (vb) {
+              renderVoteButtons(vb, full, getRemoteLastChoice(pollId));
+              // Authoritative selection rehydrate (requires identity)
+              await fetchRemoteMyBallotAndApplySelection(full, pollId, vb);
+            }
+
+            if (full?.results) {
+              const norm = normalizeResults(full.results);
+              renderPrettyResults(full, norm);
+            }
+          }
+        }
+      } catch (e) {
+        // If this fails, we still try SSE below.
+        console.warn("Remote poll hydration failed:", e);
+      }    
+      // Fetch results once (works even if SSE stream is missing)
+      await fetchRemoteResultsOnceAndRender(full, pollId);
+      // Authoritative selection rehydrate (requires identity)
+      if (vb) await fetchRemoteMyBallotAndApplySelection(full, pollId, vb);
+
+      // Remote stream (optional)
+      try {
+        es = new EventSource(`${EXCHANGE_API}/polls/stream`);
+        es.addEventListener("poll", async (ev) => {
+          try {
+            const obj = JSON.parse(ev.data);
+            if (obj?.poll) {
+              full = { ...obj.poll, is_local: false };
+              if (pollTitle) pollTitle.textContent = full.title || "(untitled)";
+              const pt = full?.meta?.poll_type ?? full?.poll_type ?? "";
+              if (pollMeta) pollMeta.textContent = `${pt} • Remote`;
+              if (vb) {
+                renderVoteButtons(vb, full, getRemoteLastChoice(pollId));
+                // Authoritative selection rehydrate (requires identity)
+                await fetchRemoteMyBallotAndApplySelection(full, pollId, vb);
+              }
+
+            }
+            if (obj?.results) {
+              const norm = normalizeResults(obj.results);
+              renderPrettyResults(full, norm);
+            }
+          } catch (_) {}
+        });
+        es.addEventListener("results", (ev) => {
+          try {
+            const obj = JSON.parse(ev.data);
+
+            // Exchange sends { poll_id, results: {...} }
+            const norm = normalizeResults(obj);
+            renderPrettyResults(full, norm);
+          } catch (e) {
+            // If parsing fails, keep something visible in audit JSON.
+            const resultsBox = document.getElementById("resultsBox");
+            if (resultsBox) resultsBox.textContent = String(ev.data || "");
+          }
+        });
+        es.onerror = () => {
+          // Exchange can legitimately return 404 for /stream even when the poll exists.
+          // Don't overwrite valid results with a scary error message.
+          try { es.close(); } catch (_) {}
+          // Leave whatever results are already shown in resultsBox.
+        };
+
+      } catch (e) {
+        if (resultsBox) resultsBox.textContent = "Live results unavailable.";
+      }
+    }
+  }
+
+
+  // =========================
+  // Remote results hydration (do not rely on SSE)
+  // =========================
+  async function fetchRemoteResultsOnceAndRender(poll, pollId) {
+    try {
+      const r = await fetch(`${EXCHANGE_API}/polls/${encodeURIComponent(String(pollId))}/results`, { method: "GET" });
+      if (!r.ok) return false;
+      const data = await r.json();
+      const norm = normalizeResults(data);
+      renderPrettyResults(poll, norm);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // =========================
+  // Remote selection hydration (authoritative; requires HMAC identity)
+  // =========================
+  async function fetchRemoteMyBallotAndApplySelection(poll, pollId, vb) {
+    try {
+      const pid = String(pollId);
+
+      // If no identity, we can't ask "my ballot" (identity-only endpoint).
+      if (!getExchangeHmacCredsOrNull()) {
+        patchVoteSession(pid, { last_error_code: "NO_IDENTITY" });
+        // No banner by default; user can still view results.
+        return false;
+      }
+
+      const r = await exchangeFetchAuthed(`/polls/${encodeURIComponent(pid)}/my-ballot`, { method: "GET" });
+      const raw = await r.text().catch(() => "");
+      let data = null;
+      try { data = raw ? JSON.parse(raw) : null; } catch { data = null; }
+
+      if (!r.ok) {
+        if (r.status === 401 || r.status === 403) {
+          patchVoteSession(pid, { last_error_code: "BAD_SIGNATURE", last_checked_at_ms: Date.now() });
+          setPollStatus("BAD_SIGNATURE", "Identity signature was rejected by the Exchange for this request. (Your vote state can’t be verified on this device.)");
+        } else if (r.status === 404) {
+          // Some older Exchange builds may not have my-ballot yet.
+          patchVoteSession(pid, { last_error_code: "MY_BALLOT_UNAVAILABLE", last_checked_at_ms: Date.now() });
+          setPollStatus(null, null);
+        }
+        return false;
+      }
+
+      if (!data?.ok) return false;
+
+      const hasVote = data?.has_vote === true;
+      patchVoteSession(pid, { last_known_has_vote: hasVote, last_checked_at_ms: Date.now() });
+
+      // STRANDED detection:
+      const localToken = getToken(pid);
+      if (hasVote && !localToken) {
+        markStranded(pid, "missing_token");
+      } else {
+        clearStrandedUi(pid);
+      }
+
+      if (!hasVote) return true;
+
+      const optionId = String(data.option_id || "");
+      if (!optionId) return true;
+
+      let label = (typeof data.option_label === "string") ? data.option_label : "";
+      if (!label && poll?.options) {
+        const opt = (poll.options || []).find(o => String(o?.id) === optionId);
+        if (opt && typeof opt.label !== "undefined") label = String(opt.label);
+      }
+
+      if (label && vb) {
+        setRemoteLastChoice(pid, label);
+        renderVoteButtons(vb, poll, label);
+      }
+
+      return true;
+    } catch (_e) {
+      patchVoteSession(String(pollId), { last_error_code: "NETWORK" });
+      return false;
+    }
+  }
+
+
+
+  // =========================
+  // Remote voting with one-step self-heal
+  // =========================
+  async function exchangeVoteWithRetry(poll, pollId, option_id, choiceLabel, outEl, opts) {
+    // Attempt order:
+    // 1) If we have a voter_token, try X-Voter-Token (no stamp).
+    //    If token is rejected, clear it and fall back to stamp once.
+    // 2) If no token (or token rejected), get a stamp and try X-Stamp.
+    //    If stamp is rejected, clear stamp pool, mint once, retry once.
+    const payload = { option_id };
+
+    const allowStamp = (opts && Object.prototype.hasOwnProperty.call(opts, "allowStamp")) ? !!opts.allowStamp : true;
+
+    const attempt = async (headers) => {
+      const r = await fetch(`${EXCHANGE_API}/polls/${encodeURIComponent(String(pollId))}/vote`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...headers },
+        body: JSON.stringify(payload),
+      });
+      const raw = await r.text().catch(() => "");
+      let data = null;
+      try { data = JSON.parse(raw); } catch { data = null; }
+      return { ok: r.ok, status: r.status, raw, data };
+    };
+
+    const existingToken = getToken(pollId);
+
+    // ---- try voter token path first (if present)
+    if (existingToken) {
+      const res = await attempt({ "X-Voter-Token": String(existingToken) });
+      if (res.ok) {
+        if (res.data?.voter_token) setToken(pollId, res.data.voter_token);
+        setRemoteLastChoice(pollId, choiceLabel);
+        if (outEl) outEl.textContent = "Voted.";
+        return { ok: true, used: "voter_token", data: res.data };
+      }
+
+      // If token was rejected, do NOT fall back to stamp automatically.
+      // This prevents accidental double-intent when the Exchange already has a vote.
+      const errText = String(res.data?.error || res.raw || "");
+      if (res.status === 403 && errText.includes("invalid X-Voter-Token")) {
+        clearToken(pollId);
+        markStranded(pollId, "invalid_token");
+        if (outEl) outEl.textContent = "Revote token rejected. This device is stranded for changes.";
+        return { ok: false, error: "invalid_voter_token", stranded: true };
+      }
+
+      if (outEl) outEl.textContent = `Vote failed (${res.status}).`;
+      return { ok: false, error: res.raw || String(res.status) };
+    }
+
+    // ---- stamp path (first vote)
+    if (!allowStamp) {
+      if (outEl) outEl.textContent = "Vote blocked: Exchange indicates an existing vote (or vote state unknown).";
+      return { ok: false, error: "stamp_disallowed" };
+    }
+
+    let stamp = await getOrFetchOneStampOrNull();
+    if (!stamp) {
+      if (outEl) outEl.textContent = "Vote blocked: could not obtain stamp.";
+      return { ok: false, error: "no stamp" };
+    }
+
+    let res1 = await attempt({ "X-Stamp": stamp });
+    if (res1.ok) {
+      if (res1.data?.voter_token) setToken(pollId, res1.data.voter_token);
+      setRemoteLastChoice(pollId, choiceLabel);
+      if (outEl) outEl.textContent = "Voted.";
+      return { ok: true, used: "stamp", data: res1.data };
+    }
+
+    // If stamp rejected, clear pool, mint once, retry once.
+    if (res1.status === 403 && String(res1.raw || "").includes("invalid X-Stamp")) {
+      clearExchangeStampPool();
+      if (outEl) outEl.textContent = "Stamp expired. Refreshing stamp…";
+      try {
+        await fetchStampsFromExchange();
+      } catch {}
+      const stamp2 = await getOrFetchOneStampOrNull();
+      if (!stamp2) {
+        if (outEl) outEl.textContent = "Vote blocked: could not refresh stamp.";
+        return { ok: false, error: "no stamp after refresh" };
+      }
+      const res2 = await attempt({ "X-Stamp": stamp2 });
+      if (res2.ok) {
+        if (res2.data?.voter_token) setToken(pollId, res2.data.voter_token);
+        setRemoteLastChoice(pollId, choiceLabel);
+        if (outEl) outEl.textContent = "Voted.";
+        return { ok: true, used: "stamp_retry", data: res2.data };
+      }
+      if (outEl) outEl.textContent = `Vote failed (${res2.status}).`;
+      return { ok: false, error: res2.raw || String(res2.status) };
+    }
+
+    if (outEl) outEl.textContent = `Vote failed (${res1.status}).`;
+    return { ok: false, error: res1.raw || String(res1.status) };
+  }
+
+  // =========================
+  // Vote (Local-first; remote optional)
+  // =========================
+  async function assertPollToExchange(localPoll) {
+    const out = document.getElementById("assertOut");
+    if (out) out.textContent = "Asserting…";
+
+    const pollId = localPoll?.id;
+    const localKey = String(localPoll?.meta?.created_local_id || pollId);
+    const isLocal = !!localPoll?.is_local || String(pollId).startsWith("local_");
+    if (!isLocal) { if (out) out.textContent = "Already asserted."; return; }
+
+    // HMAC identity is required to assert a local poll to the Exchange
+    const creds = getExchangeHmacCredsOrNull();
+    if (!creds) { if (out) out.textContent = "Missing identity: create/import an Exchange identity first."; return; }
+    
+    const localChoice = getLocalSelectedChoice(localPoll);
+
+    // --- NEW: Fetch stamps once (human-triggered, not on app open) ---
+    // This proves stamp issuance works, and stores the pool in localStorage.
+    try {
+      const before = getExchangeStampPool().length;
+      if (!before) {
+        if (out) out.textContent = "Fetching stamps…";
+        await fetchStampsFromExchange();
+      }
+      const after = getExchangeStampPool().length;
+      if (out) out.textContent = `Stamps stored: ${after}. Asserting…`;
+    } catch (e) {
+      // Stamp fetch failure should not block assertion (for now).
+      console.warn("Stamp fetch failed:", e);
+      if (out) out.textContent = "Stamp fetch failed (continuing assert)…";
+    }
+
+    // --- NEW: If this poll was already asserted before, reuse the existing exchange poll ---
+    // We match by meta.created_local_id (which you already set during assert).
+    try {
+      const rList = await fetch(`${EXCHANGE_API}/polls`, { method: "GET" });
+      if (rList.ok) {
+        const list = await rList.json();
+        const polls = Array.isArray(list?.polls) ? list.polls : [];
+
+        // Find an exchange poll whose meta.created_local_id matches our local poll id.
+        // If multiple exist (because of past duplicates), pick the newest by created_at.
+        const matches = polls.filter(p => String(p?.meta?.created_local_id || "") === String(localKey));
+        if (matches.length) {
+          matches.sort((a, b) => String(b?.created_at || "").localeCompare(String(a?.created_at || "")));
+          const found = matches[0];
+
+          if (out) out.textContent = localChoice
+            ? "Already on Exchange — casting your vote…"
+            : "Already on Exchange — opening…";
+
+          // If we have a local vote, cast it on the Exchange (visible failure, no rollback)
+          if (localChoice) {
+            try {
+              // We only have an id here; fetch full poll to get options/ids
+              const rList2 = await fetch(`${EXCHANGE_API}/polls`, { method: "GET" });
+              if (rList2.ok) {
+                const list2 = await rList2.json();
+                const polls2 = Array.isArray(list2?.polls) ? list2.polls : [];
+                const fullRemote = polls2.find(p => String(p?.id) === String(found.id));
+                if (fullRemote) await castExchangeVoteByLabel(fullRemote, localChoice, out);
+              }
+            } catch (e) {
+              if (out) out.textContent = "Vote carry failed (network). Poll is live.";
+              console.warn(e);
+            }
+          }
+
+          // Exchange is authoritative: purge local reality
+          purgeLocalPollState(pollId);
+
+          await refreshPolls();
+          await openPoll({ id: found.id, is_local: false });
+          return;
+
+        }
+      }
+    } catch (e) {
+      // If lookup fails, we fall back to POST assert below.
+      console.warn("Exchange poll lookup failed (continuing with POST):", e);
+    }
+
+    // Build exchange-shaped canonical payload from existing local fields (no re-asking)
+    const payload = {
+      title: localPoll.title,
+      description: localPoll.question_html || "",
+      type: "single",
+      options: (localPoll.options || []).map(label => ({ label: String(label) })),
+      meta: {
+        poll_type: localPoll.poll_type || "",
+        question_html: localPoll.question_html || "",
+        created_local_id: localKey,
+        asserted_at: Date.now(),
+      },
+    };
+
+    try {
+      const r = await exchangeFetchAuthed("/polls", {
+        method: "POST",
+        body: payload,
+      });
+
+      const raw = await r.text();
+      if (!r.ok) {
+        if (out) out.textContent = `Assert failed (${r.status}).`;
+        console.log("Assert failed:", r.status, raw);
+        return;
+      }
+
+      const data = JSON.parse(raw);
+      const remotePoll = data?.poll;
+      if (!remotePoll?.id) {
+        if (out) out.textContent = "Assert ok, but response missing poll id.";
+        console.log("Assert response:", data);
+        return;
+      }
+
+      // Optional: carry local vote forward (visible failure, no rollback)
+      if (localChoice) {
+        if (out) out.textContent = "Poll live — casting your vote…";
+        try {
+          await castExchangeVoteByLabel(remotePoll, localChoice, out);
+        } catch (e) {
+          if (out) out.textContent = "Vote carry failed (network). Poll is live.";
+          console.warn(e);
+        }
+      } else {
+        if (out) out.textContent = "Poll live on Exchange.";
+      }
+
+      // Exchange is authoritative: purge local poll + local votes
+      purgeLocalPollState(pollId);
+
+      await refreshPolls();
+      await openPoll({ id: remotePoll.id, is_local: false });
+    } catch (e) {
+      if (out) out.textContent = "Assert failed (network error).";
+      console.log(e);
+    }
+  }
+
+  async function getOrFetchOneStampOrNull() {
+    // If we already have stamps, pick one.
+    const pool = getExchangeStampPool();
+    if (pool.length) return pickOneStampOrNull();
+
+    // If we have an identity (HMAC creds), try to mint stamps.
+    const creds = getExchangeHmacCredsOrNull();
+    if (!creds) return null;
+
+    try {
+      await fetchStampsFromExchange();
+      return pickOneStampOrNull();
+    } catch (e) {
+      console.warn("Stamp fetch failed:", e);
+      return null;
+    }
+  }
+ 
+  async function castVote(poll, choice) {
+    const pollId = poll.id;
+    const isLocal = !!poll.is_local || String(pollId).startsWith("local_");
+    const out = document.getElementById("voteOut");
+    const resultsBox = document.getElementById("resultsBox");
+
+    if (out) out.textContent = "Submitting…";
+
+    if (isLocal) {
+      const token = ensureLocalToken(pollId);
+      setLocalVote(pollId, token, choice, poll.options || []);
+      if (out) out.textContent = "Voted (local).";
+
+      const res = buildLocalResults(poll);
+      const norm = normalizeResults(res);
+      renderPrettyResults(poll, norm);
+
+      return;
+    }
+
+
+    // Remote best-effort (Exchange)
+    // Remote best-effort (Exchange)
+    const pollIdStr = String(pollId);
+
+    // Map the clicked label -> exchange option_id.
+    const opts = (poll.options || []);
+    const idx = opts.findIndex(o => (o?.label ?? o) === choice);
+    if (idx < 0) { if (out) out.textContent = "Vote failed (bad option)."; return; }
+
+    const optObj = opts[idx];
+    const option_id = (optObj && typeof optObj === "object" && optObj.id != null)
+      ? String(optObj.id)
+      : String(idx + 1); // fallback to 1-based ordering
+
+    // UI hint (local only): remember last choice for this poll
+    setRemoteLastChoice(pollIdStr, choice);
+
+    // Pre-check (authoritative when available): if Exchange says we already voted,
+    // do NOT attempt stamp-vote on this device. This prevents phantom revote loops.
+    const sessionBefore = getVoteSession(pollIdStr);
+    // If we haven't checked recently, try once now (best effort).
+    if (!sessionBefore.last_checked_at_ms || (Date.now() - sessionBefore.last_checked_at_ms) > 5000) {
+      try {
+        const vbTmp = document.getElementById("voteButtons");
+        await fetchRemoteMyBallotAndApplySelection(poll, pollIdStr, vbTmp);
+      } catch {}
+    }
+
+    const session = getVoteSession(pollIdStr);
+    const tokenNow = getToken(pollIdStr);
+
+    if (session.last_known_has_vote === true && !tokenNow) {
+      // Stranded: explicit local refusal
+      markStranded(pollIdStr, "missing_token");
+      if (out) out.textContent = "Vote cannot be changed on this device (missing revote token).";
+      return;
+    }
+
+    // Prevent double-posts
+    setUiBusy(true, "Submitting…");
+    try {
+      const allowStamp = (getVoteSession(pollIdStr).last_known_has_vote !== true);
+      const res = await exchangeVoteWithRetry(poll, pollIdStr, option_id, choice, out, { allowStamp });
+
+      // Re-render buttons so selection is obvious immediately
+      const vbNow = document.getElementById("voteButtons");
+      if (vbNow) renderVoteButtons(vbNow, poll, choice);
+
+      // Always refresh results once after a successful vote
+      if (res?.ok) {
+        await fetchRemoteResultsOnceAndRender(poll, pollIdStr);
+      }
+    } catch (e) {
+      if (out) out.textContent = "Vote failed (network error).";
+    } finally {
+      setUiBusy(false, null);
+    }
+
+  }
+
+  // =========================
+  // Phase 1: Tabs / page switching
+  // =========================
+  function showTab(tabName) {
+    // Remember current tab in memory (you already added currentTab)
+    currentTab = tabName;
+
+    // Find the 3 page containers from the new HTML
+    const viewCreate = document.getElementById("viewCreate");
+    const viewPolls = document.getElementById("viewPolls");
+    const viewSettings = document.getElementById("viewSettings");
+
+    // Hide all, then show the requested one
+    if (viewCreate) viewCreate.style.display = (tabName === "create") ? "" : "none";
+    if (viewPolls) viewPolls.style.display = (tabName === "polls") ? "" : "none";
+    if (viewSettings) viewSettings.style.display = (tabName === "settings") ? "" : "none";
+
+    // Update tab visual active state (uses your existing .pill.active CSS)
+    const tabCreate = document.getElementById("tabCreate");
+    const tabPolls = document.getElementById("tabPolls");
+    const tabSettings = document.getElementById("tabSettings");
+
+    if (tabCreate) tabCreate.classList.toggle("active", tabName === "create");
+    if (tabPolls) tabPolls.classList.toggle("active", tabName === "polls");
+    if (tabSettings) tabSettings.classList.toggle("active", tabName === "settings");
+
+    // When entering Settings, refresh trust summary (signed).
+    if (tabName === "settings") {
+      // Fire-and-forget; UI will show status if possible.
+      const exchangeStatus = document.getElementById("exchangeStatus");
+      refreshTrustVisibilityUi(exchangeStatus);
+    }
+  }
+
+  function showPollList() {
+    const listCard = document.getElementById("pollsListCard");
+    const pollView = document.getElementById("pollView");
+    if (listCard) listCard.style.display = "";
+    if (pollView) pollView.style.display = "none";
+    inPollDetail = false;
+  }
+
+  function showPollDetail() {
+    const listCard = document.getElementById("pollsListCard");
+    const pollView = document.getElementById("pollView");
+    if (listCard) listCard.style.display = "none";
+    if (pollView) pollView.style.display = "block";
+    inPollDetail = true;
+  }
+
+
+  function showPollDetail() {
+    const listCard = document.getElementById("pollsListCard");
+    const pollView = document.getElementById("pollView");
+    if (listCard) listCard.style.display = "none";
+    if (pollView) pollView.style.display = "block";
+    inPollDetail = true;
+  }
+
+  function showPollList() {
+    const listCard = document.getElementById("pollsListCard");
+    const pollView = document.getElementById("pollView");
+    if (listCard) listCard.style.display = "block";
+    if (pollView) pollView.style.display = "none";
+    inPollDetail = false;
+  }
+
+  // =========================
+  // Main init (runs after app.html injected)
+  // =========================
+  function initLegacyUI() {
+    // Guard: injected HTML must exist
+    if (!document.getElementById("createPoll")) return;
+
+    if (window.__initLegacyUI_ran) return;
+    window.__initLegacyUI_ran = true;
+    // Poll status banner buttons (poll view)
+    const clearHintBtn = document.getElementById("clearVoteHintBtn");
+    if (clearHintBtn) {
+      clearHintBtn.onclick = () => {
+        if (!currentPollId) return;
+        clearLocalVoteHintOnly(currentPollId, null);
+        setPollStatus(null, null);
+        const out = document.getElementById("voteOut");
+        if (out) out.textContent = "Local vote hint cleared.";
+      };
+    }
+
+    const clearTokBtn = document.getElementById("clearRevoteTokenBtn");
+    if (clearTokBtn) {
+      clearTokBtn.onclick = () => {
+        if (!currentPollId) return;
+        clearToken(String(currentPollId));
+        patchVoteSession(String(currentPollId), { stranded_reason: "missing_token" });
+        markStranded(String(currentPollId), "missing_token");
+        const out = document.getElementById("voteOut");
+        if (out) out.textContent = "Revote token cleared locally for this poll.";
+      };
+    }
+
+
+    // Optional editor
+    try { initQuestionEditor(); } catch {}
+
+    // Advanced settings UI
+    const apiBase = document.getElementById("apiBase");
+    const apiStatus = document.getElementById("apiStatus");
+    if (apiBase) apiBase.value = API;
+
+    const saveApi = document.getElementById("saveApi");
+    if (saveApi) {
+      saveApi.onclick = async () => {
+        const v = (apiBase?.value || "").trim().replace(/\/+$/, "");
+        if (!v) return;
+        API = v;
+        localStorage.setItem(LS_API, API);
+        if (apiStatus) apiStatus.textContent = "Saved. Checking…";
+        await ping();
+        await refreshPolls();
+      };
+        // Publish-to-exchange toggle: reveal the hidden API settings card
+      
+      const publishEl = document.getElementById("publishToExchange");
+      const apiCardEl = document.getElementById("apiCard");
+
+      const syncPublishUi = () => {
+        if (!apiCardEl) return;
+
+        if (publishEl && publishEl.checked) {
+          apiCardEl.style.display = "block";
+
+          // Make it feel like a “pop-up”: scroll to it and focus the API box.
+          apiCardEl.scrollIntoView({ behavior: "smooth", block: "start" });
+          setTimeout(() => {
+            const apiBaseEl = document.getElementById("apiBase");
+            if (apiBaseEl) apiBaseEl.focus();
+          }, 50);
+        } else {
+          // Keep old behavior: only show if ?settings=1
+          const params = new URLSearchParams(location.search);
+          apiCardEl.style.display = (params.get("settings") === "1") ? "block" : "none";
+        }
+      };
+
+        if (publishEl) publishEl.onchange = syncPublishUi;
+        syncPublishUi();
+    }
+
+    // =========================
+    // Settings: Identity wiring (device-local)
+    // =========================
+    const identityDisplayNameEl = document.getElementById("identityDisplayName");
+    const identityPasswordEl = document.getElementById("identitySigningKey"); // UX label is "Password"
+    const createIdentityBtn = document.getElementById("createIdentityBtn");
+    const copyRecoveryBtn = document.getElementById("copyIdentityBackupBtn");
+    const copyAliasBtn = document.getElementById("copyPublicAliasBtn");
+
+    const identityStatus = document.getElementById("identityStatus");
+    const exchangeStatus = document.getElementById("exchangeStatus"); // optional status line on Settings
+
+    // Load saved display name
+    if (identityDisplayNameEl) {
+      identityDisplayNameEl.value = (localStorage.getItem("exchange_display_name") || "");
+      identityDisplayNameEl.onchange = () => {
+        localStorage.setItem("exchange_display_name", String(identityDisplayNameEl.value || "").trim());
+      };
+    }
+
+    // If identity exists, hide Create button.
+    const refreshIdentityUi = () => {
+      const has = !!getExchangeHmacCredsOrNull();
+      if (createIdentityBtn) createIdentityBtn.style.display = has ? "none" : "";
+      if (copyRecoveryBtn) copyRecoveryBtn.style.display = has ? "" : "none";
+      if (identityPasswordEl) {
+        // Never show the stored signing key; just show a neutral placeholder
+        identityPasswordEl.value = "";
+        identityPasswordEl.placeholder = has
+          ? "Identity is stored on this device. Use Copy Recovery Code if needed."
+          : "Create identity to enable Exchange actions (or paste recovery key + save).";
+      }
+      if (identityStatus) identityStatus.textContent = has
+        ? "Identity loaded (details hidden)."
+        : "No identity on this device.";
+    };
+
+    // Allow “import” by pasting the signing key and hitting Enter (MVP).
+    // NOTE: Without self_id we can’t sign; so this is placeholder until we add full recovery paste format.
+    if (identityPasswordEl) {
+      identityPasswordEl.onkeydown = (ev) => {
+        if (ev.key === "Enter") {
+          // We intentionally do NOT support partial import here yet.
+          // Recovery is via the copied JSON blob (next button).
+          if (identityStatus) identityStatus.textContent = "Use Copy Recovery Code to backup, or Create Identity to generate.";
+        }
+      };
+    }
+
+    if (createIdentityBtn) {
+      createIdentityBtn.onclick = async () => {
+        try {
+          if (createIdentityBtn) createIdentityBtn.disabled = true;
+          const data = await exchangeCreateIdentityWithPow(identityStatus);
+          if (identityStatus) identityStatus.textContent = "Identity created. Copy your recovery code now.";
+      
+
+
+    refreshIdentityUi();
+          // Fetch authoritative trust summary for the new identity
+          await refreshTrustVisibilityUi(exchangeStatus || identityStatus);
+
+          if (exchangeStatus) exchangeStatus.textContent = "Identity ready. Signed endpoints enabled.";
+        } catch (e) {
+          if (identityStatus) identityStatus.textContent = String(e?.message || e);
+        } finally {
+          if (createIdentityBtn) createIdentityBtn.disabled = false;
+        }
+      };
+    }
+
+    if (copyRecoveryBtn) {
+      copyRecoveryBtn.onclick = async () => {
+        try {
+          const self_id = getExchangeSelfIdOrNull();
+          const signing_key = getExchangeSigningKeyOrNull();
+          const public_alias = getExchangeAliasOrNull();
+
+          if (!self_id || !signing_key) {
+            if (identityStatus) identityStatus.textContent = "No identity to back up.";
+            return;
+          }
+
+          // Copy a JSON blob (human-auditable)
+          const blob = JSON.stringify({ self_id, signing_key, public_alias }, null, 2);
+
+          await copyTextToClipboardOrThrow(blob);
+
+          if (identityStatus) identityStatus.textContent = "Recovery code copied to clipboard. Store it safely.";
+        } catch (e) {
+          if (identityStatus) identityStatus.textContent = `Copy failed: ${String(e?.message || e)}`;
+        }
+      };
+    }
+
+
+    if (copyAliasBtn) {
+      copyAliasBtn.onclick = async () => {
+        try {
+          const a = getExchangeAliasOrNull();
+          if (!a) {
+            if (identityStatus) identityStatus.textContent = "No public alias available.";
+            return;
+          }
+          await copyTextToClipboardOrThrow(String(a));
+          if (identityStatus) identityStatus.textContent = "Public alias copied.";
+        } catch (e) {
+          if (identityStatus) identityStatus.textContent = `Copy failed: ${String(e?.message || e)}`;
+        }
+      };
+    }
+
+    // Always refresh trust visibility when Settings is initialized.
+    // (Also called on Settings tab open.)
+    refreshTrustVisibilityUi(exchangeStatus || identityStatus);
+    // =========================
+    
+
+
+// =========================
+// Settings: Admin Mode (session-only operator key)
+// =========================
+const operatorKeyInput = document.getElementById("operatorKeyInput");
+const adminToggleBtn = document.getElementById("adminToggleBtn");
+
+if (adminToggleBtn) {
+  adminToggleBtn.onclick = () => {
+    if (isAdminEnabled()) {
+      // Disable: wipe in-memory key and hide panels
+      setOperatorKeyMem("");
+      setAdminEnabled(false);
+      if (operatorKeyInput) operatorKeyInput.value = "";
+      return;
+    }
+
+    const k = (operatorKeyInput?.value || "").trim();
+    if (!k) {
+      const s = document.getElementById("adminStatus");
+      if (s) s.textContent = "Enter an operator key to enable Admin Mode.";
+      return;
+    }
+
+    setOperatorKeyMem(k);
+    setAdminEnabled(true);
+
+    // Optional safety: clear the input box after enabling
+    if (operatorKeyInput) operatorKeyInput.value = "";
+  };
+} else {
+  // If the button isn't present, ensure admin-only sections are hidden.
+  setAdminEnabled(false);
+}
+
+// Ensure Admin Mode starts OFF on load.
+setOperatorKeyMem("");
+setAdminEnabled(false);
+
+// =========================
+// Settings: Trust Admin (grant/revoke earned trust)
+// =========================
+const trustTargetAliasInput = document.getElementById("trustTargetAliasInput");
+const trustDeltaInput = document.getElementById("trustDeltaInput");
+const trustReasonInput = document.getElementById("trustReasonInput");
+const trustApplyBtn = document.getElementById("trustApplyBtn");
+const trustStatus = document.getElementById("trustStatus");
+
+async function exchangeGrantTrust(public_alias, weight_delta, reason) {
+  const opKey = getOperatorKeyMemOrNull();
+  if (!isAdminEnabled() || !opKey) {
+    throw new Error("Admin Mode not enabled (operator key missing).");
+  }
+
+  const alias = String(public_alias || "").trim();
+  const delta = Number(weight_delta);
+
+  if (!alias) throw new Error("public_alias is required.");
+  if (!Number.isFinite(delta)) throw new Error("weight_delta must be a number.");
+
+  const body = {
+    public_alias: alias,
+    weight_delta: delta,              // ✅ backend expects this name
+    reason: String(reason || "").trim(),
+  };
+
+  const r = await exchangeFetchAuthed("/identity/grant-trust", {
+    method: "POST",
+    body,
+    headers: { "X-Operator-Key": opKey },
+  });
+
+  const raw = await r.text().catch(() => "");
+  if (!r.ok) throw new Error(`Trust grant failed (${r.status}). ${raw}`);
+  try { return JSON.parse(raw); } catch { return { ok: true }; }
+}
+
+
+if (trustApplyBtn) {
+  trustApplyBtn.onclick = async () => {
+    try {
+      const alias = (trustTargetAliasInput?.value || "").trim();
+      const deltaRaw = (trustDeltaInput?.value || "").trim();
+      const reason = (trustReasonInput?.value || "").trim();
+
+      const delta = Number(deltaRaw);
+
+      if (!alias) { if (trustStatus) trustStatus.textContent = "Enter a target public_alias."; return; }
+      if (!Number.isFinite(delta) || !Number.isInteger(delta)) { if (trustStatus) trustStatus.textContent = "Delta must be an integer (e.g. 1 or -1)."; return; }
+      if (!reason) { if (trustStatus) trustStatus.textContent = "Enter a reason."; return; }
+
+      setUiBusy(true, "Applying trust grant…");
+      const data = await exchangeGrantTrust(alias, delta, reason);
+
+      if (trustStatus) {
+        // Show a tiny summary; backend fields may vary.
+        const applied = data?.issued_weights ? JSON.stringify(data.issued_weights) : "";
+        trustStatus.textContent = `Applied. ${applied}`.trim();
+      }
+    } catch (e) {
+      if (trustStatus) trustStatus.textContent = String(e?.message || e);
+    } finally {
+      setUiBusy(false, null);
+    }
+  };
+}
+
+// =========================
+// Settings: Stamps (debug only)
+// =========================
+// Stamps are still minted on-demand for normal voting,
+// but manual minting is NOT exposed in the UI.
+const stampStatus = document.getElementById("stampStatus");
+const clearStampsBtn = document.getElementById("clearStampsBtn");
+
+const refreshStampUi = () => {
+  if (!stampStatus) return;
+  const n = getExchangeStampPool().length;
+  stampStatus.textContent = n ? "Stamp cached (hidden)." : "No stamp cached.";
+};
+
+if (clearStampsBtn) {
+  clearStampsBtn.onclick = async () => {
+    try {
+      if (!isAdminEnabled()) {
+        if (stampStatus) stampStatus.textContent = "Enable Admin Mode to purge stamps.";
+        return;
+      }
+      setUiBusy(true, "Purging stamps…");
+      setExchangeStampPool([]);
+      refreshStampUi();
+      if (stampStatus) stampStatus.textContent = "Stamps purged.";
+    } catch (e) {
+      if (stampStatus) stampStatus.textContent = `Purge failed: ${String(e?.message || e)}`;
+    } finally {
+      setUiBusy(false, null);
+    }
+  };
+}
+
+// Keep status accurate on page load.
+refreshStampUi();
+
+// =========================
+    // Settings: Delegation
+    // =========================
+    const delegateeAliasInput = document.getElementById("delegateeAliasInput");
+    const delegateAmountInput = document.getElementById("delegateAmountInput");
+    const delegationSetBtn = document.getElementById("delegationSetBtn");
+    const delegationRevokeBtn = document.getElementById("delegationRevokeBtn");
+    const delegationStatus = document.getElementById("delegationStatus");
+
+
+// =========================
+// Settings: Outbound Delegations (ACTIVE only)
+// =========================
+const delegationRefreshBtn = document.getElementById("delegationRefreshBtn");
+const delegationOutboundStatus = document.getElementById("delegationOutboundStatus");
+const delegationOutboundList = document.getElementById("delegationOutboundList");
+
+function fmtIsoShort(isoOrNull) {
+  if (!isoOrNull) return "—";
+  const t = Date.parse(String(isoOrNull));
+  if (!Number.isFinite(t)) return "—";
+  // YYYY-MM-DD (operator-legible; no locale surprises)
+  return new Date(t).toISOString().slice(0, 10);
+}
+
+function renderOutboundList(rows) {
+  if (!delegationOutboundList) return;
+  delegationOutboundList.innerHTML = "";
+
+  if (!Array.isArray(rows) || rows.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "muted2";
+    empty.textContent = "No active outbound delegations.";
+    delegationOutboundList.appendChild(empty);
+    return;
+  }
+
+  for (const r of rows) {
+    const alias = r?.delegatee_alias || null;
+    const amount = Number(r?.amount || 0);
+
+    const row = document.createElement("div");
+    row.className = "row";
+    row.style.gap = "10px";
+    row.style.alignItems = "center";
+    row.style.justifyContent = "space-between";
+    row.style.padding = "12px";
+    row.style.border = "1px solid var(--stroke)";
+    row.style.borderRadius = "14px";
+    row.style.background = "rgba(255,255,255,.03)";
+    row.style.color = "var(--text)";
+
+    const left = document.createElement("div");
+    left.style.display = "flex";
+    left.style.flexDirection = "column";
+    left.style.gap = "2px";
+    left.style.minWidth = "0";
+
+    // Label + alias id (local-only label, per identity)
+    const label = alias ? getAliasLabelOrNull(alias) : null;
+
+    const top = document.createElement("div");
+    top.style.display = "flex";
+    top.style.gap = "10px";
+    top.style.alignItems = "baseline";
+    top.style.minWidth = "0";
+
+    const primary = document.createElement("strong");
+    primary.textContent = label ? String(label) : (alias ? String(alias) : "(unknown alias)");
+    primary.style.overflow = "hidden";
+    primary.style.textOverflow = "ellipsis";
+    primary.style.whiteSpace = "nowrap";
+
+    const amtEl = document.createElement("span");
+    amtEl.className = "muted";
+    amtEl.textContent = `amount=${amount}`;
+
+    top.appendChild(primary);
+    top.appendChild(amtEl);
+
+    const aliasId = document.createElement("div");
+    aliasId.className = "muted2";
+    aliasId.style.fontSize = "12px";
+    aliasId.textContent = alias ? String(alias) : "";
+
+    const meta = document.createElement("div");
+    meta.className = "muted2";
+    meta.style.fontSize = "12px";
+    meta.textContent = `expires ${fmtIsoShort(r?.expires_at)} · updated ${fmtIsoShort(r?.updated_at || r?.created_at)}`;
+
+    left.appendChild(top);
+    if (label) left.appendChild(aliasId);
+    left.appendChild(meta);
+
+    const right = document.createElement("div");
+    right.style.display = "flex";
+    right.style.gap = "8px";
+    right.style.alignItems = "center";
+
+    const labelBtn = document.createElement("button");
+    labelBtn.type = "button";
+    labelBtn.className = "smallBtn";
+    labelBtn.textContent = "Label";
+    labelBtn.onclick = async () => {
+      try {
+        if (!alias) return;
+        const current = getAliasLabelOrNull(alias) || "";
+        const next = prompt(
+          `Set a local label for:\n${alias}\n\nExamples: @grant, @alice\n(Leave blank to clear)`,
+          current
+        );
+        if (next === null) return; // user canceled
+        setAliasLabel(alias, next);
+        await refreshOutboundDelegationsUi();
+      } catch (e) {
+        if (delegationOutboundStatus) delegationOutboundStatus.textContent = String(e?.message || e);
+      }
+    };
+
+    const revokeBtn = document.createElement("button");
+    revokeBtn.type = "button";
+    revokeBtn.className = "smallBtn";
+    revokeBtn.textContent = "Revoke";
+    revokeBtn.onclick = async () => {
+      try {
+        if (!alias) {
+          if (delegationOutboundStatus) delegationOutboundStatus.textContent = "Cannot revoke: missing delegatee alias.";
+          return;
+        }
+        setUiBusy(true, "Revoking delegation…");
+        await exchangeRevokeDelegation(String(alias));
+
+        if (delegationOutboundStatus) delegationOutboundStatus.textContent = "Delegation revoked.";
+        await refreshTrustVisibilityUi(exchangeStatus || identityStatus);
+        await refreshOutboundDelegationsUi();
+      } catch (e) {
+        if (delegationOutboundStatus) delegationOutboundStatus.textContent = String(e?.message || e);
+      } finally {
+        setUiBusy(false, null);
+      }
+    };
+
+    right.appendChild(labelBtn);
+    right.appendChild(revokeBtn);
+
+    row.appendChild(left);
+    row.appendChild(right);
+
+    delegationOutboundList.appendChild(row);
+  }
+}
+
+async function refreshOutboundDelegationsUi() {
+  if (!delegationOutboundStatus || !delegationOutboundList) return;
+
+  const hasIdentity = !!getExchangeHmacCredsOrNull();
+  if (!hasIdentity) {
+    delegationOutboundStatus.textContent = "Outbound list unavailable (no identity).";
+    renderOutboundList([]);
+    return;
+  }
+
+  delegationOutboundStatus.textContent = "Fetching outbound delegations…";
+  try {
+    const r = await exchangeFetchAuthed("/delegation/outbound", { method: "GET" });
+    const raw = await r.text().catch(() => "");
+    if (!r.ok) {
+      delegationOutboundStatus.textContent = `Outbound list unavailable (${r.status}). ${raw}`;
+      renderOutboundList([]);
+      return;
+    }
+    let data = null;
+    try { data = JSON.parse(raw); } catch { data = null; }
+    const rows = (data && Array.isArray(data.outbound)) ? data.outbound : [];
+    const cap = Number(data?.cap || 0);
+    delegationOutboundStatus.textContent = `Loaded (${rows.length}${cap ? " / cap " + cap : ""}).`;
+    renderOutboundList(rows);
+  } catch (e) {
+    delegationOutboundStatus.textContent = String(e?.message || e);
+    renderOutboundList([]);
+  }
+}
+
+if (delegationRefreshBtn) {
+  delegationRefreshBtn.onclick = async () => {
+    try {
+      await refreshTrustVisibilityUi(exchangeStatus || identityStatus);
+      await refreshOutboundDelegationsUi();
+    } catch (e) {
+      if (delegationOutboundStatus) delegationOutboundStatus.textContent = String(e?.message || e);
+    }
+  };
+}
+
+
+    // convenience: remember last typed values (local only)
+    if (delegateeAliasInput) delegateeAliasInput.value = localStorage.getItem("exchange_last_delegatee_alias") || "";
+    if (delegateAmountInput) delegateAmountInput.value = localStorage.getItem("exchange_last_delegate_amount") || "";
+
+    async function exchangeSetDelegation(delegatee_alias, amount) {
+  const self_id = getExchangeSelfIdOrNull();
+  if (!self_id) throw new Error("Missing Exchange identity (self_id).");
+
+  const body = {
+    self_id: String(self_id),
+    delegatee_alias: String(delegatee_alias),
+    amount: Number(amount),
+  };
+
+  const r = await exchangeFetchAuthed("/delegation/set", { method: "POST", body });
+  const raw = await r.text().catch(() => "");
+  if (!r.ok) throw new Error(`Delegation set failed (${r.status}). ${raw}`);
+  try { return JSON.parse(raw); } catch { return { ok: true }; }
+}
+
+    async function exchangeRevokeDelegation(delegatee_alias) {
+  const self_id = getExchangeSelfIdOrNull();
+  if (!self_id) throw new Error("Missing Exchange identity (self_id).");
+
+  const body = {
+    self_id: String(self_id),
+    delegatee_alias: String(delegatee_alias),
+  };
+
+  const r = await exchangeFetchAuthed("/delegation/revoke", { method: "POST", body });
+  const raw = await r.text().catch(() => "");
+  if (!r.ok) throw new Error(`Delegation revoke failed (${r.status}). ${raw}`);
+  try { return JSON.parse(raw); } catch { return { ok: true }; }
+}
+
+    if (delegationSetBtn) {
+      delegationSetBtn.onclick = async () => {
+        try {
+          const alias = (delegateeAliasInput?.value || "").trim();
+          const amtRaw = (delegateAmountInput?.value || "").trim();
+          const amt = Number(amtRaw);
+          if (!alias) { if (delegationStatus) delegationStatus.textContent = "Enter a delegatee alias."; return; }
+          if (!Number.isFinite(amt) || amt <= 0) { if (delegationStatus) delegationStatus.textContent = "Enter a positive amount."; return; }
+
+          localStorage.setItem("exchange_last_delegatee_alias", alias);
+          localStorage.setItem("exchange_last_delegate_amount", String(amt));
+
+          setUiBusy(true, "Setting delegation…");
+          const data = await exchangeSetDelegation(alias, amt);
+
+          await refreshOutboundDelegationsUi();
+      if (delegationStatus) {
+            // Show a few helpful fields if present (backend may vary)
+            const a = data?.delegated_out_sum != null ? `delegated_out_sum=${data.delegated_out_sum}` : "";
+            const b = data?.delegator_available_weight != null ? `available=${data.delegator_available_weight}` : "";
+            delegationStatus.textContent = `Delegation set. ${[a, b].filter(Boolean).join(" ")}`.trim();
+          }
+        } catch (e) {
+          if (delegationStatus) delegationStatus.textContent = String(e?.message || e);
+        } finally {
+          setUiBusy(false, null);
+        }
+      };
+    }
+
+    if (delegationRevokeBtn) {
+      delegationRevokeBtn.onclick = async () => {
+        try {
+          const alias = (delegateeAliasInput?.value || "").trim();
+          if (!alias) { if (delegationStatus) delegationStatus.textContent = "Enter the delegatee alias to revoke."; return; }
+
+          setUiBusy(true, "Revoking delegation…");
+          const data = await exchangeRevokeDelegation(alias);
+
+          await refreshOutboundDelegationsUi();
+      if (delegationStatus) delegationStatus.textContent = "Delegation revoked.";
+        } catch (e) {
+          if (delegationStatus) delegationStatus.textContent = String(e?.message || e);
+        } finally {
+          setUiBusy(false, null);
+        }
+      };
+    }
+
+    refreshIdentityUi();
+
+    // Close poll view
+    const closeBtn = document.getElementById("closePoll");
+    if (closeBtn) {
+      closeBtn.onclick = () => {
+        closeStream();
+        showPollList();
+        const pollView = document.getElementById("pollView");
+        if (pollView) pollView.style.display = "none";
+      };
+    }
+      
+    // Back to list (Poll Detail -> Poll List)
+    const backToListBtn = document.getElementById("backToList");
+    if (backToListBtn) {
+      backToListBtn.onclick = () => {
+        currentPollId = null;
+        showPollList(); // you will add/confirm this helper in the next step
+        // Optional: clear hash so reload doesn't auto-open
+        // window.location.hash = "";
+      };
+    }
+
+    // Refresh
+    const refreshBtn = document.getElementById("refreshPolls");
+    if (refreshBtn) refreshBtn.onclick = refreshPolls;
+
+    // Search
+    const searchEl = document.getElementById("search");
+    if (searchEl) searchEl.addEventListener("input", refreshPolls);
+
+    // Create (LOCAL-FIRST)
+    const createBtn = document.getElementById("createPoll");
+    if (createBtn) {
+      createBtn.onclick = async () => {
+        const out = document.getElementById("createOut");
+        const btn = document.getElementById("createPoll");
+        if (!out || !btn) return;
+
+        const title = (document.getElementById("newTitle")?.value || "").trim();
+        const poll_type = document.getElementById("newType")?.value || "YES_NO";
+        const raw = (document.getElementById("newOptions")?.value || "")
+          .split("\n").map(x => x.trim()).filter(Boolean);
+        const options = (poll_type === "YES_NO" && raw.length === 0) ? ["Yes", "No"] : raw;
+
+        const question_html = (quill && quill.root) ? quill.root.innerHTML : "";
+
+        if (!title) { out.textContent = "Title required."; return; }
+        if (options.length < 2) { out.textContent = "Need at least 2 options."; return; }
+
+        btn.disabled = true;
+        out.textContent = "Creating (local)…";
+
+        try {
+          const id = "local_" + makeId();
+          const localPoll = {
+            id,
+            title,
+            poll_type,
+            options,
+            question_html,
+            created_at: Date.now(),
+            is_local: true,
+            status: "OPEN",
+          };
+
+          addLocalPoll(localPoll);
+
+          out.textContent = "Created (local).";
+
+          const tEl = document.getElementById("newTitle");
+          const oEl = document.getElementById("newOptions");
+          if (tEl) tEl.value = "";
+          if (oEl) oEl.value = "";
+
+          await refreshPolls();
+          await openPoll(localPoll);
+        } finally {
+          btn.disabled = false;
+        }
+      };
+    }
+
+    // Share
+    const shareBtn = document.getElementById("shareBtn");
+    if (shareBtn) {
+      shareBtn.onclick = () => {
+        const link = currentPollId ? pollLink(currentPollId) : window.location.href;
+        openQr(link);
+      };
+    }
+      // =========================
+    // Phase 1: Global tabs wiring
+    // =========================
+    const tabCreate = document.getElementById("tabCreate");
+    const tabPolls = document.getElementById("tabPolls");
+    const tabSettings = document.getElementById("tabSettings");
+
+    if (tabCreate) tabCreate.onclick = () => showTab("create");
+    if (tabPolls) tabPolls.onclick = () => showTab("polls");
+    if (tabSettings) tabSettings.onclick = () => showTab("settings");
+
+    // Default view on startup
+    showTab(currentTab || "create");
+
+    if (backToListBtn) {
+      backToListBtn.onclick = () => {
+        currentPollId = null;
+        showPollList();
+      };
+    }
+
+    // QR modal wiring
+    const qrClose = document.getElementById("qrClose");
+    if (qrClose) {
+      qrClose.onclick = () => {
+        const modal = document.getElementById("qrModal");
+        if (modal) modal.style.display = "none";
+      };
+    }
+
+    const copyLink = document.getElementById("copyLink");
+    const copyLinkQr = document.getElementById("copyLinkQr");
+    const copyStatus = document.getElementById("copyStatus");
+
+    async function doCopy() {
+      const link = currentPollId ? pollLink(currentPollId) : window.location.href;
+      const ok = await copyToClipboard(link);
+      if (copyStatus) copyStatus.textContent = ok ? "Copied." : "Copy failed.";
+      setTimeout(() => { if (copyStatus) copyStatus.textContent = ""; }, 1200);
+    }
+
+    if (copyLink) copyLink.onclick = doCopy;
+    if (copyLinkQr) copyLinkQr.onclick = doCopy;
+
+    // Boot
+    showApiCardIfNeeded();
+    ping().catch(() => {});
+    refreshPolls().then(openFromHash).catch(() => {});
+  }
+
+    // IMPORTANT: event hook is inside this IIFE (scope-safe)
+  let __ui_inited=false;
+function __initOnce(){ if(__uiStaticTripwireOrAbort()) return; if(__ui_inited) return; __ui_inited=true; try{ initLegacyUI(); }catch(e){ console.error("INIT_FAIL", e); }
+}
+if(document.readyState==="loading"){ document.addEventListener("DOMContentLoaded", __initOnce); } else { __initOnce(); }
+window.addEventListener("legacy:injected", __initOnce);
+})();

@@ -410,3 +410,34 @@ Rebuild after code changes.
 Verify container contents before debugging behavior.
 
 
+
+## Static UI Contract (frontend deploy)
+
+Production UI must load ONLY these canonical assets:
+
+- `/styles.css`
+- `/ui.js`
+- `/vendor/qrcode.min.js` (only if QR features are used)
+
+Forbidden in production:
+
+- Any `/src/*` assets (e.g. `/src/main.js`)
+- `type="module"` script entrypoints for the UI
+- Boot depending on custom events that are not dispatched in static deploy
+
+### Curl smoke tests
+
+- `curl -I https://<domain>/ui.js` → 200
+- `curl -I https://<domain>/styles.css` → 200
+- `curl -I https://<domain>/vendor/qrcode.min.js` → 200 (if used)
+
+Entrypoint invariant:
+
+- `curl -s https://<domain>/ | grep ui.js` → must match
+- `curl -s https://<domain>/ | grep src/main.js` → must be empty
+
+### If the UI runtime guard triggers
+
+You are serving the wrong UI build (dev/module assets) or missing `/ui.js` + `/styles.css`.
+Fix by restoring the static entrypoint in `ui/index.html` to reference `/ui.js` and `/styles.css`
+and removing any `/src/*` references, then redeploy.

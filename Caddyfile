@@ -1,0 +1,12 @@
+exchange.breadstandard.com {
+	root * /srv/ui
+	file_server
+
+	handle /api/* {
+		reverse_proxy bread-exchange:8787
+	}
+
+	handle /federation/* {
+		reverse_proxy bread-exchange:8787
+	}
+}
