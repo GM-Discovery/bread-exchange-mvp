@@ -220,8 +220,25 @@ docker compose up -d --build
 # --- Verification gates -------------------------------------------------------
 log "Gating checks..."
 
-if ! curl -fsS "https://${DOMAIN}/api/health" | jq -e '.ok == true' >/dev/null; then
-  log "FAILED: /api/health gate"
+# --- TLS wait loop -----------------------------------------------------------
+# Caddy may still be obtaining a Let's Encrypt cert when we first check.
+# We wait up to 120 seconds for https://$DOMAIN/api/health to succeed.
+TLS_WAIT_SECONDS=120
+TLS_WAIT_SLEEP=2
+deadline=$(( $(date +%s) + TLS_WAIT_SECONDS ))
+
+log "Waiting for TLS/health (up to ${TLS_WAIT_SECONDS}s)..."
+health_ok=0
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  if curl -fsS "https://${DOMAIN}/api/health" | jq -e '.ok == true' >/dev/null 2>&1; then
+    health_ok=1
+    break
+  fi
+  sleep "$TLS_WAIT_SLEEP"
+done
+
+if [ "$health_ok" -ne 1 ]; then
+  log "FAILED: /api/health gate (TLS did not become ready in time)"
   docker compose logs --no-color --tail 200 || true
   exit 1
 fi
