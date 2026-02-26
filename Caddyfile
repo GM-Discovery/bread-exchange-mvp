@@ -1,12 +1,78 @@
+{
+  # ACME CA endpoint (prod by default; installer can set staging)
+  acme_ca {$ACME_CA}
+}
+
 {$DOMAIN} {
-    root * /srv/ui
-    file_server
 
-    handle /api/* {
-        reverse_proxy bread-exchange:8787
-    }
+  # --- Match groups ----------------------------------------------------------
 
-    handle /federation/* {
-        reverse_proxy bread-exchange:8787
+  @preflight method OPTIONS
+
+  @stamp {
+    path /api/stamp
+    method POST
+  }
+
+  @vote {
+    path_regexp vote ^/api/polls/[^/]+/vote$
+    method POST
+  }
+
+  @poll_create {
+    path /api/polls
+    method POST
+  }
+
+  @grant_trust {
+    path /api/identity/grant-trust
+    method POST
+  }
+
+  @identity_create {
+    path /api/identity/create
+    method POST
+  }
+
+  respond @preflight 204
+
+  # --- Routing / Auth --------------------------------------------------------
+
+  handle @grant_trust {
+    reverse_proxy bread-exchange:8787
+  }
+
+  handle @vote {
+    reverse_proxy bread-exchange:8787
+  }
+
+  handle @poll_create {
+    reverse_proxy bread-exchange:8787
+  }
+
+  handle @identity_create {
+    reverse_proxy bread-exchange:8787
+  }
+
+  handle @stamp {
+    basicauth {
+      alpha_user {$STAMP_BASIC_BCRYPT}
     }
+    reverse_proxy bread-exchange:8787
+  }
+
+  @writes {
+    method POST PUT PATCH DELETE
+  }
+
+  handle @writes {
+    basicauth {
+      alpha_user {$WRITES_BASIC_BCRYPT}
+    }
+    reverse_proxy bread-exchange:8787
+  }
+
+  handle {
+    reverse_proxy bread-exchange:8787
+  }
 }

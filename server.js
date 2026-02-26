@@ -311,6 +311,31 @@ function requireOperatorKey(req, res, next) {
   return next();
 }
 
+// =========================================================================
+// Operator-only route mounting (fail-closed at registration time)
+// =========================================================================
+//
+// If OPERATOR_KEY is missing at startup, we still register the route,
+// but it becomes a stub that returns 503. This makes “operator endpoints
+// accidentally exposed if env var missing” impossible.
+//
+// IMPORTANT: This is evaluated at process start. If you set OPERATOR_KEY later,
+// you must restart the container/server to enable operator endpoints.
+
+function mountOperatorRoute(method, routePath, ...handlers) {
+  const m = String(method || "").toLowerCase();
+  if (typeof app[m] !== "function") {
+    throw new Error(`mountOperatorRoute: unsupported method: ${method}`);
+  }
+
+  if (!process.env.OPERATOR_KEY) {
+    console.error(`[SECURITY] OPERATOR_KEY missing; ${method.toUpperCase()} ${routePath} disabled (fail-closed).`);
+    return app[m](routePath, (req, res) => res.status(503).json({ error: "operator_key_missing" }));
+  }
+
+  return app[m](routePath, ...handlers);
+}
+
 const cfg = loadConfig();
 // Load lifecycle as an object so we can call lifecycle.setDefaults(...)
 const lifecycle = require("./lib/lifecycle");
@@ -1414,14 +1439,8 @@ app.post("/api/identity/create", (req, res) => {
   });
 });
 
-app.post("/api/identity/grant-trust", requireSignature, requireOperatorKey, (req, res) => {
-  // v0 security:
+mountOperatorRoute("post", "/api/identity/grant-trust", requireSignature, requireOperatorKey, (req, res) => {  // v0 security:
   // Require OPERATOR_KEY and require X-Operator-Key.
-  const operatorKey = process.env.OPERATOR_KEY;
-  if (operatorKey) {
-    const presented = req.get("X-Operator-Key");
-    if (presented !== operatorKey) return res.status(401).json({ error: "unauthorized" });
-  }
 
   // Expect an explicit personal weight change (earned trust)
   const { public_alias, weight_delta, reason } = req.body || {};

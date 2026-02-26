@@ -7,6 +7,9 @@ services:
       - "80:80"
       - "443:443"
     environment:
+      - ACME_CA=${ACME_CA}
+      - STAMP_BASIC_BCRYPT=${STAMP_BASIC_BCRYPT}
+      - WRITES_BASIC_BCRYPT=${WRITES_BASIC_BCRYPT}
       - DOMAIN=${DOMAIN}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro

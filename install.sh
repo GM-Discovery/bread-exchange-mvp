@@ -132,16 +132,37 @@ verify_tag_signature_and_allowlist() {
     fail "Tag signature verification failed (missing/invalid signature?) for $tag"
   fi
 
-  # Extract fingerprint line if present.
-  local fp
-  fp=$(echo "$out" | grep -E "Primary key fingerprint" -m 1 | sed -E 's/.*=\s*//' || true)
-  if [[ -z "$fp" ]]; then
+  # --- Deterministic signer fingerprint extraction (HEX-only) ---
+  # We do NOT trust the human-readable "Primary key fingerprint" line.
+  # Instead:
+  #  - parse the signing key ID from git's verification output
+  #  - ask GPG (machine format) for the primary fingerprint
+  local keyid
+  keyid="$(echo "$out" \
+    | grep -Eo 'using [A-Z0-9]+ key [0-9A-F]{8,40}' \
+    | head -n 1 \
+    | awk '{print $NF}' \
+    | tr '[:lower:]' '[:upper:]' \
+    | tr -cd '0-9A-F' \
+    || true)"
+
+  if [[ -z "$keyid" ]]; then
     echo "$out" >&2
-    fail "Could not extract signer fingerprint from 'git tag -v' output. Refusing to install."
+    fail "Could not extract signer key id from 'git tag -v' output. Refusing to install."
   fi
 
   local fp_norm
-  fp_norm=$(echo "$fp" | normalize_fp)
+  fp_norm="$(gpg --batch --with-colons --fingerprint "$keyid" 2>/dev/null \
+    | awk -F: '$1=="fpr"{print $10; exit}' \
+    | tr '[:lower:]' '[:upper:]' \
+    | tr -cd '0-9A-F' \
+    || true)"
+
+  # Fingerprints should be exactly 40 hex chars. Fail closed otherwise.
+  if [[ ${#fp_norm} -ne 40 ]]; then
+    echo "$out" >&2
+    fail "Could not deterministically derive 40-hex signer fingerprint from GPG key id ($keyid). Refusing to install."
+  fi
 
   # 2) Load allowlist FROM THE TAG (so installs can be audited per-release).
   local allow
@@ -149,16 +170,23 @@ verify_tag_signature_and_allowlist() {
     fail "Missing tools/release_signers.txt in tag ${tag} (required for release integrity gate)."
   fi
 
-  # Normalize allowlist lines and look for exact fingerprint match.
+  # Normalize allowlist lines to pure 40-hex fingerprints and look for exact match.
+  # - strip comments
+  # - strip whitespace
+  # - keep HEX only
+  # - require length==40
   local match=""
-  match=$(echo "$allow" \
+  match="$(echo "$allow" \
     | sed 's/#.*$//' \
-    | sed '/^\s*$/d' \
-    | normalize_fp \
-    | grep -Fx "$fp_norm" || true)
+    | sed '/^[[:space:]]*$/d' \
+    | tr '[:lower:]' '[:upper:]' \
+    | tr -cd '0-9A-F\n' \
+    | awk 'length($0)==40 {print $0}' \
+    | grep -Fx "$fp_norm" \
+    || true)"
 
   if [[ -z "$match" ]]; then
-    echo "Signer fingerprint: $fp_norm" >&2
+    echo "Signer fingerprint (hex): $fp_norm" >&2
     echo "Allowlist (tools/release_signers.txt in tag $tag):" >&2
     echo "$allow" >&2
     fail "Signer fingerprint not allowlisted. Refusing to install."
