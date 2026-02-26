@@ -196,8 +196,22 @@ if ! git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
   fail "Tag does not exist: ${TAG}"
 fi
 
+# Read allowlist fingerprints from the tag (ignore comments/blank lines),
+# normalize to HEX ONLY so prefixes can't break installs.
+allowlist_hex="$(git show "${TAG}:tools/release_signers.txt" \
+  | sed 's/\r$//' \
+  | sed '/^\s*#/d;/^\s*$/d' \
+  | tr -cd '0-9A-Fa-f\n' \
+  | tr '[:lower:]' '[:upper:]')"
+
 # Signature + allowlist gate
-SIGNER_FP=$(verify_tag_signature_and_allowlist "$TAG")
+signer_fp="$(verify_tag_signature_and_allowlist "$TAG")"
+
+signer_fp="$(echo "$signer_fp" | tr -cd '0-9A-Fa-f' | tr '[:lower:]' '[:upper:]')"
+
+if ! echo "$allowlist_hex" | grep -qx "$signer_fp"; then
+  fail "Signer fingerprint not allowlisted. Refusing to install."
+fi
 
 # Resolve commit hash for receipt
 COMMIT_SHA=$(git rev-list -n 1 "$TAG")
@@ -206,7 +220,7 @@ echo "Release Integrity OK"
 echo "- repo:   $REPO_URL"
 echo "- tag:    $TAG"
 echo "- commit: $COMMIT_SHA"
-echo "- signer: $SIGNER_FP"
+echo "Signer fingerprint: $signer_fp"
 
 # --- checkout/install ---
 mkdir -p "$(dirname "$INSTALL_DIR")"
