@@ -236,6 +236,7 @@ allowlist_hex="$(git show "${TAG}:tools/release_signers.txt" \
 signer_fp="$(verify_tag_signature_and_allowlist "$TAG")"
 
 signer_fp="$(echo "$signer_fp" | tr -cd '0-9A-Fa-f' | tr '[:lower:]' '[:upper:]')"
+SIGNER_FP="$signer_fp"
 
 if ! echo "$allowlist_hex" | grep -qx "$signer_fp"; then
   fail "Signer fingerprint not allowlisted. Refusing to install."
@@ -275,7 +276,7 @@ echo "Install Receipt"
 echo "- origin: $ORIGIN_URL"
 echo "- tag:    $TAG"
 echo "- commit: $RESOLVED_SHA"
-echo "- signer: $SIGNER_FP"
+echo "- signer: $signer_fp"
 echo ""
 
 # --- write .env ---
