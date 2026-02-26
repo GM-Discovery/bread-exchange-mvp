@@ -15,7 +15,7 @@ set -euo pipefail
 
 # === Maintainer constants ===
 # Set this to the canonical GitHub repo for releases.
-REPO_URL_DEFAULT="REPO_URL_NOT_SET"
+REPO_URL_DEFAULT="https://github.com/GM-Discovery/bread-exchange-mvp.git"
 INSTALL_DIR_DEFAULT="/opt/bread-exchange-mvp"
 
 ACME_PROD_CA="https://acme-v02.api.letsencrypt.org/directory"
