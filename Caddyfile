@@ -5,74 +5,16 @@
 
 {$DOMAIN} {
 
-  # Serve the UI
-  root * /srv/ui
-  file_server
+  respond /healthz 200
 
-  # API goes to Node
-  handle_path /api/* {
+  # API → Node (keep /api prefix!)
+  handle /api/* {
     reverse_proxy bread-exchange:8787
   }
 
-  # (Optional) if you have SSE endpoints not under /api:
-  # handle_path /sse/* {
-  #   reverse_proxy bread-exchange:8787
-  # }
-
-  # --- Match groups ----------------------------------------------------------
-
-  @preflight method OPTIONS
-
-  @stamp {
-    path /api/stamp
-    method POST
-  }
-
-  @vote {
-    path_regexp vote ^/api/polls/[^/]+/vote$
-    method POST
-  }
-
-  @poll_create {
-    path /api/polls
-    method POST
-  }
-
-  @grant_trust {
-    path /api/identity/grant-trust
-    method POST
-  }
-
-  @identity_create {
-    path /api/identity/create
-    method POST
-  }
-
-  respond @preflight 204
-
-  # --- Routing / Auth --------------------------------------------------------
-
-  handle @grant_trust {
-    reverse_proxy bread-exchange:8787
-  }
-
-  handle @vote {
-    reverse_proxy bread-exchange:8787
-  }
-
-  handle @poll_create {
-    reverse_proxy bread-exchange:8787
-  }
-
-  handle @identity_create {
-    reverse_proxy bread-exchange:8787
-  }
-
-  @writes {
-    method POST PUT PATCH DELETE
-  }
-
+  # UI → static files
   handle {
-    reverse_proxy bread-exchange:8787
+    root * /srv/ui
+    file_server
   }
 }
