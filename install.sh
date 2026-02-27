@@ -298,7 +298,7 @@ fi
 
 # --- compose up ---
 cd "$INSTALL_DIR"
-$DOCKER_COMPOSE_BIN up -d --build
+$DOCKER_COMPOSE_BIN up -d --build --force-recreate
 
 echo ""
 echo "Done. Next checks:"
