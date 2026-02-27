@@ -5,6 +5,20 @@
 
 {$DOMAIN} {
 
+  # Serve the UI
+  root * /srv/ui
+  file_server
+
+  # API goes to Node
+  handle_path /api/* {
+    reverse_proxy bread-exchange:8787
+  }
+
+  # (Optional) if you have SSE endpoints not under /api:
+  # handle_path /sse/* {
+  #   reverse_proxy bread-exchange:8787
+  # }
+
   # --- Match groups ----------------------------------------------------------
 
   @preflight method OPTIONS
