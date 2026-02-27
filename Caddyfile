@@ -54,22 +54,8 @@
     reverse_proxy bread-exchange:8787
   }
 
-  handle @stamp {
-    basicauth {
-      alpha_user {$STAMP_BASIC_BCRYPT}
-    }
-    reverse_proxy bread-exchange:8787
-  }
-
   @writes {
     method POST PUT PATCH DELETE
-  }
-
-  handle @writes {
-    basicauth {
-      alpha_user {$WRITES_BASIC_BCRYPT}
-    }
-    reverse_proxy bread-exchange:8787
   }
 
   handle {
