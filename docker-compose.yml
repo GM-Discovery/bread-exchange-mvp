@@ -24,7 +24,7 @@ services:
     container_name: bread-exchange
     restart: unless-stopped
     env_file:
-      - .env
+      - .env.exchange
     environment:
       - NODE_ENV=production
     volumes:

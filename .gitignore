@@ -6,6 +6,7 @@ backups/
 
 # secrets / env
 .env
+.env.exchange.*
 
 # backups
 *.bak

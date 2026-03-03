@@ -296,6 +296,33 @@ else
   grep -q '^ACME_CA=' "$ENV_FILE" && sed -i "s%^ACME_CA=.*%ACME_CA=$ACME_CA%" "$ENV_FILE" || echo "ACME_CA=$ACME_CA" >> "$ENV_FILE"
 fi
 
+EX_ENV_FILE="$INSTALL_DIR/.env.exchange"
+
+if [ ! -f "$EX_ENV_FILE" ]; then
+  umask 077
+  DOMAIN="$DOMAIN" node - <<'NODE' > "$EX_ENV_FILE"
+const crypto = require("crypto");
+
+const domain = process.env.DOMAIN || "";
+const baseUrl = domain ? `https://${domain}` : "";
+
+const exId = "ex_" + crypto.randomBytes(12).toString("hex");
+const opKey = crypto.randomBytes(32).toString("hex");
+
+const { publicKey, privateKey } = crypto.generateKeyPairSync("ed25519");
+const pubB64  = publicKey.export({ type: "spki", format: "der" }).toString("base64");
+const privB64 = privateKey.export({ type: "pkcs8", format: "der" }).toString("base64");
+
+process.stdout.write(`# Bread Exchange secret/runtime env (DO NOT COMMIT)\n`);
+process.stdout.write(`EXCHANGE_ID=${exId}\n`);
+if (baseUrl) process.stdout.write(`CANONICAL_BASE_URL=${baseUrl}\n`);
+process.stdout.write(`OPERATOR_KEY=${opKey}\n`);
+process.stdout.write(`FEDERATION_PUBLIC_KEY_B64=${pubB64}\n`);
+process.stdout.write(`FEDERATION_PRIVATE_KEY_B64=${privB64}\n`);
+NODE
+  chmod 600 "$EX_ENV_FILE" || true
+fi
+
 # --- compose up ---
 cd "$INSTALL_DIR"
 $DOCKER_COMPOSE_BIN up -d --build --force-recreate
