@@ -11,6 +11,11 @@
   handle /api/* {
     reverse_proxy bread-exchange:8787
   }
+  
+  # Exchange Network (legacy "federation") → Node (keep /federation prefix!)
+  handle /federation/* {
+    reverse_proxy bread-exchange:8787
+  }
 
   # UI → static files
   handle {

@@ -1,4 +1,4 @@
-# Exchange_Network_Node_Contract_v0_1
+# exchange_contract_v0_1
 
 ## Purpose
 Defines the network node message and store contract that exchanges must agree on to interoperate safely.

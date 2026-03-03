@@ -29,6 +29,7 @@ services:
       - NODE_ENV=production
     volumes:
       - ./data:/app/data
+      - ./exchange_contract_v0_1.md:/app/exchange_contract_v0_1.md:ro
     expose:
       - "8787"
     networks:
