@@ -300,11 +300,14 @@ EX_ENV_FILE="$INSTALL_DIR/.env.exchange"
 
 if [ ! -f "$EX_ENV_FILE" ]; then
   umask 077
-  DOMAIN="$DOMAIN" node - <<'NODE' > "$EX_ENV_FILE"
+  TMP="$EX_ENV_FILE.tmp.$$"
+
+  if command -v node >/dev/null 2>&1; then
+    DOMAIN="$DOMAIN" node - <<'NODE' > "$TMP"
 const crypto = require("crypto");
 
 const domain = process.env.DOMAIN || "";
-const baseUrl = domain ? `https://${domain}` : "";
+const baseUrl = `https://${domain}`;
 
 const exId = "ex_" + crypto.randomBytes(12).toString("hex");
 const opKey = crypto.randomBytes(32).toString("hex");
@@ -315,12 +318,39 @@ const privB64 = privateKey.export({ type: "pkcs8", format: "der" }).toString("ba
 
 process.stdout.write(`# Bread Exchange secret/runtime env (DO NOT COMMIT)\n`);
 process.stdout.write(`EXCHANGE_ID=${exId}\n`);
-if (baseUrl) process.stdout.write(`CANONICAL_BASE_URL=${baseUrl}\n`);
+process.stdout.write(`CANONICAL_BASE_URL=${baseUrl}\n`);
 process.stdout.write(`OPERATOR_KEY=${opKey}\n`);
 process.stdout.write(`FEDERATION_PUBLIC_KEY_B64=${pubB64}\n`);
 process.stdout.write(`FEDERATION_PRIVATE_KEY_B64=${privB64}\n`);
 NODE
-  chmod 600 "$EX_ENV_FILE" || true
+
+  elif command -v openssl >/dev/null 2>&1; then
+    EX_ID="ex_$(openssl rand -hex 12)"
+    OP_KEY="$(openssl rand -hex 32)"
+
+    openssl genpkey -algorithm ed25519 -outform DER -out /tmp/ex_priv.der
+    openssl pkey -in /tmp/ex_priv.der -inform DER -pubout -outform DER -out /tmp/ex_pub.der
+
+    PRIV_B64="$(base64 -w0 /tmp/ex_priv.der)"
+    PUB_B64="$(base64 -w0 /tmp/ex_pub.der)"
+
+    rm -f /tmp/ex_priv.der /tmp/ex_pub.der
+
+    cat > "$TMP" <<EOF
+# Bread Exchange secret/runtime env (DO NOT COMMIT)
+EXCHANGE_ID=$EX_ID
+CANONICAL_BASE_URL=https://$DOMAIN
+OPERATOR_KEY=$OP_KEY
+FEDERATION_PUBLIC_KEY_B64=$PUB_B64
+FEDERATION_PRIVATE_KEY_B64=$PRIV_B64
+EOF
+  else
+    echo "FATAL: cannot generate .env.exchange (need node or openssl on host)" >&2
+    exit 1
+  fi
+
+  chmod 600 "$TMP" || true
+  mv -f "$TMP" "$EX_ENV_FILE"
 fi
 
 # --- compose up ---
