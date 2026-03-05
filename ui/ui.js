@@ -100,6 +100,14 @@ function getOperatorKeyMemOrNull() { return __operatorKeyMem ? __operatorKeyMem 
 function setAdminEnabled(enabled) {
   __adminEnabled = !!enabled;
 
+  const tabNetwork = document.getElementById("tabNetwork");
+  if (tabNetwork) tabNetwork.style.display = __adminEnabled ? "" : "none";
+
+  // If admin is turned off while on Network, kick back to Settings
+  if (!__adminEnabled && currentTab === "network") {
+    showTab("settings");
+  }
+
   // Toggle admin-only UI
   const adminOnly = document.getElementById("adminOnlySection");
   if (adminOnly) adminOnly.style.display = __adminEnabled ? "block" : "none";
@@ -146,7 +154,7 @@ function setAdminEnabled(enabled) {
   let es = null; // EventSource (remote live stream only)
   let currentPollId = null;
   let quill = null; // optional Quill instance
-  let currentTab = "create";   // "create" | "polls" | "settings"
+  let currentTab = "create";   // "create" | "polls" | "settings" | "network"
   let inPollDetail = false;   // true when viewing a single poll
 
 
@@ -1923,24 +1931,28 @@ function setAliasLabel(public_alias, labelOrNull) {
     // Remember current tab in memory (you already added currentTab)
     currentTab = tabName;
 
-    // Find the 3 page containers from the new HTML
+    // Find the 4 page containers from the new HTML
     const viewCreate = document.getElementById("viewCreate");
     const viewPolls = document.getElementById("viewPolls");
     const viewSettings = document.getElementById("viewSettings");
+    const viewNetwork = document.getElementById("viewNetwork");
 
     // Hide all, then show the requested one
     if (viewCreate) viewCreate.style.display = (tabName === "create") ? "" : "none";
     if (viewPolls) viewPolls.style.display = (tabName === "polls") ? "" : "none";
     if (viewSettings) viewSettings.style.display = (tabName === "settings") ? "" : "none";
+    if (viewNetwork) viewNetwork.style.display = (tabName === "network") ? "" : "none";
 
     // Update tab visual active state (uses your existing .pill.active CSS)
     const tabCreate = document.getElementById("tabCreate");
     const tabPolls = document.getElementById("tabPolls");
     const tabSettings = document.getElementById("tabSettings");
+    const tabNetwork = document.getElementById("tabNetwork");
 
     if (tabCreate) tabCreate.classList.toggle("active", tabName === "create");
     if (tabPolls) tabPolls.classList.toggle("active", tabName === "polls");
     if (tabSettings) tabSettings.classList.toggle("active", tabName === "settings");
+    if (tabNetwork) tabNetwork.classList.toggle("active", tabName === "network");
 
     // When entering Settings, refresh trust summary (signed).
     if (tabName === "settings") {
@@ -2181,7 +2193,94 @@ function setAliasLabel(public_alias, labelOrNull) {
     refreshTrustVisibilityUi(exchangeStatus || identityStatus);
     // =========================
     
+// =========================
+// Network tab (Federation UI)
+// =========================
 
+async function federationFetch(path, opts) {
+  const k = getOperatorKeyMemOrNull();
+  const headers = Object.assign({}, (opts && opts.headers) ? opts.headers : {});
+  if (k) headers["X-Operator-Key"] = k;
+  if (!headers["Content-Type"]) headers["Content-Type"] = "application/json";
+
+  const url = window.location.origin.replace(/\/$/, "") + path;
+  const res = await fetch(url, Object.assign({}, opts || {}, { headers }));
+  const text = await res.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch { json = { raw: text }; }
+  if (!res.ok) {
+    const err = new Error(`HTTP ${res.status}`);
+    err.status = res.status;
+    err.body = json;
+    throw err;
+  }
+  return json;
+}
+
+async function netRefreshStatus() {
+  const out = document.getElementById("netOut");
+  const pre = document.getElementById("netStatusJson");
+  try {
+    if (out) out.textContent = "Loading status…";
+    const j = await federationFetch("/federation/status", { method: "GET", headers: { "Content-Type": "text/plain" } });
+    if (pre) pre.textContent = JSON.stringify(j, null, 2);
+    if (out) out.textContent = "Status OK.";
+  } catch (e) {
+    if (out) out.textContent = `Status failed: ${String(e?.body?.error || e?.message || e)}`;
+  }
+}
+
+async function netRefreshPartners() {
+  const out = document.getElementById("netOut");
+  const pre = document.getElementById("netPartnersJson");
+  try {
+    if (out) out.textContent = "Loading partners…";
+    const j = await federationFetch("/federation/partners", { method: "GET", headers: { "Content-Type": "text/plain" } });
+    if (pre) pre.textContent = JSON.stringify(j, null, 2);
+    if (out) out.textContent = "Partners OK.";
+  } catch (e) {
+    if (out) out.textContent = `Partners failed: ${String(e?.body?.error || e?.message || e)}`;
+  }
+}
+
+async function netSendHello() {
+  const out = document.getElementById("netOut");
+  const url = (document.getElementById("netPartnerUrl")?.value || "").trim().replace(/\/$/, "");
+  const notes = (document.getElementById("netPartnerNotes")?.value || "").trim();
+
+  if (!url) {
+    if (out) out.textContent = "Enter partner base URL.";
+    return;
+  }
+
+  try {
+    if (out) out.textContent = "Sending HELLO…";
+
+    // This assumes you have an operator endpoint that triggers an outbound HELLO.
+    // If your server uses a different path, change it here to match routes.js.
+    const j = await federationFetch("/federation/partners/hello", {
+      method: "POST",
+      body: JSON.stringify({ canonical_base_url: url, notes }),
+    });
+
+    if (out) out.textContent = "HELLO sent.";
+    await netRefreshPartners();
+    return j;
+  } catch (e) {
+    if (out) out.textContent = `HELLO failed: ${String(e?.body?.error || e?.message || e)}`;
+  }
+}
+
+// Hook buttons once (safe even if Network tab isn't present)
+(function wireNetworkTabOnce(){
+  const sBtn = document.getElementById("netRefreshStatusBtn");
+  const pBtn = document.getElementById("netRefreshPartnersBtn");
+  const hBtn = document.getElementById("netSendHelloBtn");
+
+  if (sBtn) sBtn.onclick = netRefreshStatus;
+  if (pBtn) pBtn.onclick = netRefreshPartners;
+  if (hBtn) hBtn.onclick = netSendHello;
+})();
 
 // =========================
 // Settings: Admin Mode (session-only operator key)
@@ -2702,11 +2801,13 @@ if (delegationRefreshBtn) {
     const tabCreate = document.getElementById("tabCreate");
     const tabPolls = document.getElementById("tabPolls");
     const tabSettings = document.getElementById("tabSettings");
+    const tabNetwork = document.getElementById("tabNetwork");
 
     if (tabCreate) tabCreate.onclick = () => showTab("create");
     if (tabPolls) tabPolls.onclick = () => showTab("polls");
     if (tabSettings) tabSettings.onclick = () => showTab("settings");
-
+    if (tabNetwork) tabNetwork.onclick = () => showTab("network");
+    
     // Default view on startup
     showTab(currentTab || "create");
 

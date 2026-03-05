@@ -35,6 +35,7 @@
             <button id="tabCreate" class="pill active" type="button" data-tab="create" style="width:auto;">Create Poll</button>
             <button id="tabPolls" class="pill" type="button" data-tab="polls" style="width:auto;">Polls</button>
             <button id="tabSettings" class="pill" type="button" data-tab="settings" style="width:auto;">Settings</button>
+            <button id="tabNetwork" class="pill" type="button" data-tab="network" style="width:auto; display:none;">Network</button>
           </div>
         </div>
 
@@ -293,6 +294,40 @@
               <div id="statDelegatedAvailable" style="font-size:18px; font-weight:600;">—</div>
             </div>
           </div>
+      <section id="viewNetwork" style="display:none;">
+        <div class="card">
+          <h2 style="margin:0;">Network</h2>
+          <div class="muted2" style="font-size:12px; margin-top:6px;">
+            Operator-only federation tools. Visible only in Admin Mode.
+          </div>
+
+          <hr />
+
+          <div class="row" style="gap:10px; flex-wrap:wrap;">
+            <button id="netRefreshStatusBtn" type="button" class="btn-ghost">Refresh Status</button>
+            <button id="netRefreshPartnersBtn" type="button" class="btn-ghost">Refresh Partners</button>
+            <span id="netOut" class="muted"></span>
+          </div>
+
+          <div class="grid" style="margin-top:12px;">
+            <label style="display:block; font-weight:600;">Partner Base URL</label>
+            <input id="netPartnerUrl" placeholder="https://exchange.example.com" />
+
+            <label style="display:block; font-weight:600;">Notes</label>
+            <input id="netPartnerNotes" placeholder="optional (e.g. 'breadstandard exchange')" />
+
+            <div class="row" style="gap:10px; flex-wrap:wrap;">
+              <button id="netSendHelloBtn" type="button">Send HELLO</button>
+            </div>
+
+            <label style="display:block; font-weight:600; margin-top:10px;">Status JSON</label>
+            <pre id="netStatusJson" class="muted2" style="white-space:pre-wrap; overflow:auto; max-height:240px; padding:10px; border:1px solid #eee; border-radius:12px;"></pre>
+
+            <label style="display:block; font-weight:600;">Partners JSON</label>
+            <pre id="netPartnersJson" class="muted2" style="white-space:pre-wrap; overflow:auto; max-height:320px; padding:10px; border:1px solid #eee; border-radius:12px;"></pre>
+          </div>
+        </div>
+      </section>    
 <h3 style="margin-top:6px;">Admin Mode</h3>
 <div class="muted2" style="font-size:12px; margin-bottom:10px;">
   Admin Mode is session-only. Operator key is kept in memory and not saved.
