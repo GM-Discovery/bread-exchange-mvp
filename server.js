@@ -2255,7 +2255,7 @@ app.post("/api/polls/:id/vote", (req, res) => {
 
 app.post("/api/polls/:id/vote-anonymous", (req, res) => {
   const pollId = req.params.id;
-  const { option_id } = req.body || {};
+  const { option_id, voter_token } = req.body || {};
   if (!option_id) return res.status(400).json({ error: "option_id is required" });
 
   const db = loadDB();
@@ -2291,34 +2291,71 @@ app.post("/api/polls/:id/vote-anonymous", (req, res) => {
     return res.status(400).json({ error: "bad_option_id" });
   }
 
-  // MVP anonymous vote: fixed weight 1, no identity, no representation, no stamp
-  db.votes.push({
-    id: nanoid(12),
-    poll_id: pollId,
-    option_id: String(option_id),
+  const now = nowIso();
 
-    persona_id: null,
-    voter_token: null,
-    persona_ballot_uid: null,
+  // Anonymous voter token:
+  // - if client already has one, reuse it
+  // - otherwise mint one now
+  const anonVoterToken =
+    (typeof voter_token === "string" && voter_token.trim())
+      ? voter_token.trim()
+      : `anon_${nanoid(24)}`;
 
-    weight: 1,
-    issued_weight_used: 1,
-    stamp_hash: null,
+  // If this token already has a ballot on this poll, replace it instead of stacking duplicates.
+  const existingVote = db.votes.find(v =>
+    String(v.poll_id) === String(pollId) &&
+    String(v.voter_token || "") === String(anonVoterToken) &&
+    String(v.mode || "") === "ANONYMOUS"
+  );
 
-    mode: "ANONYMOUS",
-    created_at: nowIso(),
-    updated_at: null,
-    meta: {
+  if (existingVote) {
+    existingVote.option_id = String(option_id);
+    existingVote.updated_at = now;
+    existingVote.weight = 1;
+    existingVote.issued_weight_used = 1;
+    existingVote.meta = {
+      ...(existingVote.meta || {}),
       ...(req.body?.meta || {}),
       anonymous: true,
-    },
-  });
+    };
 
-  db.events.push({
-    kind: "vote_cast_anonymous",
-    poll_id: pollId,
-    at: nowIso(),
-  });
+    db.events.push({
+      kind: "vote_recast_anonymous",
+      poll_id: pollId,
+      vote_id: existingVote.id,
+      at: now,
+    });
+  } else {
+    // First anonymous vote: fixed weight 1, no identity, no representation, no stamp
+    db.votes.push({
+      id: nanoid(12),
+      poll_id: pollId,
+      option_id: String(option_id),
+
+      persona_id: null,
+      voter_token: anonVoterToken,
+      persona_ballot_uid: null,
+
+      weight: 1,
+      issued_weight_used: 1,
+      stamp_hash: null,
+
+      mode: "ANONYMOUS",
+      created_at: now,
+      updated_at: null,
+      meta: {
+        ...(req.body?.meta || {}),
+        anonymous: true,
+      },
+    });
+
+    db.events.push({
+      kind: "vote_cast_anonymous",
+      poll_id: pollId,
+      voter_token: anonVoterToken,
+      at: now,
+    });
+  }
 
   saveDB(db);
 
@@ -2328,6 +2365,7 @@ app.post("/api/polls/:id/vote-anonymous", (req, res) => {
   return res.json({
     ok: true,
     anonymous: true,
+    voter_token: anonVoterToken,
     message: "Vote counted anonymously. Sign in to assign a representative or use earned voting weight.",
     results,
   });

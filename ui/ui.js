@@ -1888,7 +1888,7 @@ function setAliasLabel(public_alias, labelOrNull) {
           await fetchRemoteResultsOnceAndRender(poll, pollIdStr);
         }
       } catch (e) {
-        if (out) out.textContent = "Anonymous vote failed (network error).";
+        if (out) out.textContent = "Anonymous vote failed (Create an identity to assert polls. Anonymous voting works only on already live Exchange polls.).";
       } finally {
         setUiBusy(false, null);
       }
@@ -1999,6 +1999,10 @@ function setAliasLabel(public_alias, labelOrNull) {
     if (tabPolls) tabPolls.classList.toggle("active", tabName === "polls");
     if (tabSettings) tabSettings.classList.toggle("active", tabName === "settings");
     if (tabNetwork) tabNetwork.classList.toggle("active", tabName === "network");
+
+    if (tabName === "network") {
+      try { refreshNetworkUi(); } catch (e) { console.warn(e); }
+    }
 
     // When entering Settings, refresh trust summary (signed).
     if (tabName === "settings") {
@@ -2861,7 +2865,7 @@ if (delegationRefreshBtn) {
     if (tabNetwork) tabNetwork.onclick = () => showTab("network");
     
     // Default view on startup
-    showTab(currentTab || "create");
+    showTab(currentTab || "polls");
 
     if (backToListBtn) {
       backToListBtn.onclick = () => {
