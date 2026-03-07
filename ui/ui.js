@@ -1593,6 +1593,7 @@ function setAliasLabel(public_alias, labelOrNull) {
     //    If token is rejected, clear it and fall back to stamp once.
     // 2) If no token (or token rejected), get a stamp and try X-Stamp.
     //    If stamp is rejected, clear stamp pool, mint once, retry once.
+    
     const payload = { option_id };
 
     const allowStamp = (opts && Object.prototype.hasOwnProperty.call(opts, "allowStamp")) ? !!opts.allowStamp : true;
@@ -1777,6 +1778,7 @@ function setAliasLabel(public_alias, labelOrNull) {
         question_html: localPoll.question_html || "",
         created_local_id: localKey,
         asserted_at: Date.now(),
+        anonymous_allowed: localPoll?.meta?.anonymous_allowed === true,
       },
     };
 
@@ -1843,12 +1845,56 @@ function setAliasLabel(public_alias, labelOrNull) {
     }
   }
  
+  async function castAnonymousExchangeVote(poll, option_id, out) {
+    const r = await fetch(`${EXCHANGE_API}/polls/${encodeURIComponent(poll.id)}/vote-anonymous`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ option_id }),
+    });
+
+    const raw = await r.text();
+    let data = null;
+    try { data = JSON.parse(raw); } catch {}
+
+    if (!r.ok) {
+      if (out) out.textContent = data?.error || `Anonymous vote failed (${r.status}).`;
+      return { ok: false, data };
+    }
+
+    if (out) out.textContent =
+      data?.message ||
+      "Vote counted anonymously. Sign in to assign a representative or use earned voting weight.";
+
+    return { ok: true, data };
+  }
+
   async function castVote(poll, choice) {
     const pollId = poll.id;
     const isLocal = !!poll.is_local || String(pollId).startsWith("local_");
     const out = document.getElementById("voteOut");
     const resultsBox = document.getElementById("resultsBox");
+    const creds = getExchangeHmacCredsOrNull();
+    const anonymousAllowed = poll?.meta?.anonymous_allowed === true;
 
+    if (!creds && anonymousAllowed) {
+      setUiBusy(true, "Submitting…");
+      try {
+        const res = await castAnonymousExchangeVote(poll, option_id, out);
+
+        const vbNow = document.getElementById("voteButtons");
+        if (vbNow) renderVoteButtons(vbNow, poll, choice);
+
+        if (res?.ok) {
+          await fetchRemoteResultsOnceAndRender(poll, pollIdStr);
+        }
+      } catch (e) {
+        if (out) out.textContent = "Anonymous vote failed (network error).";
+      } finally {
+        setUiBusy(false, null);
+      }
+      return;
+    }
+    
     if (out) out.textContent = "Submitting…";
 
     if (isLocal) {
@@ -2751,6 +2797,9 @@ if (delegationRefreshBtn) {
 
         const question_html = (quill && quill.root) ? quill.root.innerHTML : "";
 
+        const anonymous_allowed =
+          document.getElementById("allowAnonymousCheckbox")?.checked === true;
+
         if (!title) { out.textContent = "Title required."; return; }
         if (options.length < 2) { out.textContent = "Need at least 2 options."; return; }
 
@@ -2768,6 +2817,9 @@ if (delegationRefreshBtn) {
             created_at: Date.now(),
             is_local: true,
             status: "OPEN",
+            meta: {
+              anonymous_allowed,
+            },
           };
 
           addLocalPoll(localPoll);

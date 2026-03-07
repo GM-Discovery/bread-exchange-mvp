@@ -2253,6 +2253,86 @@ app.post("/api/polls/:id/vote", (req, res) => {
   return res.json({ ok: true, voter_token: personaUid, results });
 });
 
+app.post("/api/polls/:id/vote-anonymous", (req, res) => {
+  const pollId = req.params.id;
+  const { option_id } = req.body || {};
+  if (!option_id) return res.status(400).json({ error: "option_id is required" });
+
+  const db = loadDB();
+
+  const poll = db.polls.find(p => p.id === pollId);
+  if (!poll) return res.status(404).json({ error: "poll not found" });
+
+  // Apply lifecycle on access
+  const life = applyLifecycle(poll, nowIso());
+  if (life.changed) saveDB(db);
+
+  if (!canVote(poll)) return res.status(400).json({ error: "poll is closed" });
+
+  // Anonymous voting must be explicitly allowed on the poll
+  const anonymousAllowed = poll?.meta?.anonymous_allowed === true;
+  if (!anonymousAllowed) {
+    return res.status(403).json({ error: "identity_required" });
+  }
+
+  // Cooldown stays override-only. Anonymous first-votes are not allowed there.
+  if (String(poll.status) === "cooldown") {
+    return res.status(403).json({ error: "cooldown_override_only" });
+  }
+
+  // Validate option exists on this poll
+  const options = Array.isArray(poll.options) ? poll.options : [];
+  const optionExists = options.some((o, idx) => {
+    if (o && typeof o === "object" && o.id != null) return String(o.id) === String(option_id);
+    return String(idx + 1) === String(option_id);
+  });
+
+  if (!optionExists) {
+    return res.status(400).json({ error: "bad_option_id" });
+  }
+
+  // MVP anonymous vote: fixed weight 1, no identity, no representation, no stamp
+  db.votes.push({
+    id: nanoid(12),
+    poll_id: pollId,
+    option_id: String(option_id),
+
+    persona_id: null,
+    voter_token: null,
+    persona_ballot_uid: null,
+
+    weight: 1,
+    issued_weight_used: 1,
+    stamp_hash: null,
+
+    mode: "ANONYMOUS",
+    created_at: nowIso(),
+    updated_at: null,
+    meta: {
+      ...(req.body?.meta || {}),
+      anonymous: true,
+    },
+  });
+
+  db.events.push({
+    kind: "vote_cast_anonymous",
+    poll_id: pollId,
+    at: nowIso(),
+  });
+
+  saveDB(db);
+
+  const results = getAuthoritativeResults(db, poll);
+  broadcast(pollId, "results", { poll_id: pollId, results });
+
+  return res.json({
+    ok: true,
+    anonymous: true,
+    message: "Vote counted anonymously. Sign in to assign a representative or use earned voting weight.",
+    results,
+  });
+});
+
 // Legitimacy Snapshot at Close
 function isLegitimacyPoll(poll) {
   // Tag-driven classification (minimal “tags”, not a full tag system)
