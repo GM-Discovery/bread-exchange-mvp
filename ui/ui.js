@@ -1846,10 +1846,17 @@ function setAliasLabel(public_alias, labelOrNull) {
   }
  
   async function castAnonymousExchangeVote(poll, option_id, out) {
+    const pollIdStr = String(poll?.id || "");
+    const anonTokenKey = `anon_voter_token:${pollIdStr}`;
+    const existingAnonToken = localStorage.getItem(anonTokenKey);
+
+    const body = { option_id };
+    if (existingAnonToken) body.voter_token = existingAnonToken;
+
     const r = await fetch(`${EXCHANGE_API}/polls/${encodeURIComponent(poll.id)}/vote-anonymous`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ option_id }),
+      body: JSON.stringify(body),
     });
 
     const raw = await r.text();
@@ -1861,9 +1868,16 @@ function setAliasLabel(public_alias, labelOrNull) {
       return { ok: false, data };
     }
 
-    if (out) out.textContent =
-      data?.message ||
-      "Vote counted anonymously. Sign in to assign a representative or use earned voting weight.";
+    // Store anonymous voter token for future revotes on this same poll
+    if (data?.voter_token) {
+      localStorage.setItem(anonTokenKey, String(data.voter_token));
+    }
+
+    if (out) {
+      out.textContent =
+        data?.message ||
+        "Vote counted anonymously. Sign in to assign a representative or use earned voting weight.";
+    }
 
     return { ok: true, data };
   }
@@ -1871,11 +1885,41 @@ function setAliasLabel(public_alias, labelOrNull) {
   async function castVote(poll, choice) {
     const pollId = poll.id;
     const isLocal = !!poll.is_local || String(pollId).startsWith("local_");
+    const pollIdStr = String(pollId);
+
     const out = document.getElementById("voteOut");
     const resultsBox = document.getElementById("resultsBox");
+
+    if (out) out.textContent = "Submitting…";
+
+    if (isLocal) {
+      const token = ensureLocalToken(pollId);
+      setLocalVote(pollId, token, choice, poll.options || []);
+      if (out) out.textContent = "Voted (local).";
+
+      const res = buildLocalResults(poll);
+      const norm = normalizeResults(res);
+      renderPrettyResults(poll, norm);
+      return;
+    }
+
+    // Map the clicked label -> exchange option_id.
+    const opts = (poll.options || []);
+    const idx = opts.findIndex(o => (o?.label ?? o) === choice);
+    if (idx < 0) {
+      if (out) out.textContent = "Vote failed (bad option).";
+      return;
+    }
+
+    const optObj = opts[idx];
+    const option_id = (optObj && typeof optObj === "object" && optObj.id != null)
+      ? String(optObj.id)
+      : String(idx + 1); // fallback to 1-based ordering
+
     const creds = getExchangeHmacCredsOrNull();
     const anonymousAllowed = poll?.meta?.anonymous_allowed === true;
 
+    // Anonymous path: only for already-live Exchange polls that explicitly allow it
     if (!creds && anonymousAllowed) {
       setUiBusy(true, "Submitting…");
       try {
@@ -1888,41 +1932,15 @@ function setAliasLabel(public_alias, labelOrNull) {
           await fetchRemoteResultsOnceAndRender(poll, pollIdStr);
         }
       } catch (e) {
-        if (out) out.textContent = "Anonymous vote failed (Create an identity to assert polls. Anonymous voting works only on already live Exchange polls.).";
+        if (out) {
+          out.textContent =
+            "Anonymous voting works only on already-live Exchange polls. Create an identity to assert polls.";
+        }
       } finally {
         setUiBusy(false, null);
       }
       return;
     }
-    
-    if (out) out.textContent = "Submitting…";
-
-    if (isLocal) {
-      const token = ensureLocalToken(pollId);
-      setLocalVote(pollId, token, choice, poll.options || []);
-      if (out) out.textContent = "Voted (local).";
-
-      const res = buildLocalResults(poll);
-      const norm = normalizeResults(res);
-      renderPrettyResults(poll, norm);
-
-      return;
-    }
-
-
-    // Remote best-effort (Exchange)
-    // Remote best-effort (Exchange)
-    const pollIdStr = String(pollId);
-
-    // Map the clicked label -> exchange option_id.
-    const opts = (poll.options || []);
-    const idx = opts.findIndex(o => (o?.label ?? o) === choice);
-    if (idx < 0) { if (out) out.textContent = "Vote failed (bad option)."; return; }
-
-    const optObj = opts[idx];
-    const option_id = (optObj && typeof optObj === "object" && optObj.id != null)
-      ? String(optObj.id)
-      : String(idx + 1); // fallback to 1-based ordering
 
     // UI hint (local only): remember last choice for this poll
     setRemoteLastChoice(pollIdStr, choice);
@@ -1930,6 +1948,7 @@ function setAliasLabel(public_alias, labelOrNull) {
     // Pre-check (authoritative when available): if Exchange says we already voted,
     // do NOT attempt stamp-vote on this device. This prevents phantom revote loops.
     const sessionBefore = getVoteSession(pollIdStr);
+
     // If we haven't checked recently, try once now (best effort).
     if (!sessionBefore.last_checked_at_ms || (Date.now() - sessionBefore.last_checked_at_ms) > 5000) {
       try {
@@ -1967,7 +1986,6 @@ function setAliasLabel(public_alias, labelOrNull) {
     } finally {
       setUiBusy(false, null);
     }
-
   }
 
   // =========================
