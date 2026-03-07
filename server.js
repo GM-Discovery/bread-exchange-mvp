@@ -2472,7 +2472,8 @@ function computeResults(db, pollId) {
     people_voted: new Set(
       votes.map(v => v.persona_ballot_uid || v.voter_token).filter(Boolean)
     ).size,       // one stored vote per ballotUid (unique stamp per poll)
-    represented_people: wSum,          // sum of weights
+    represented_weight: wSum,          // sum of weights
+    represented_people: null,          // future - use representational graph to determine unique people represented per vote then sum
     weights_used: { min: wMin, max: wMax, sum: wSum, count: wCount },
 
     validated: true,
