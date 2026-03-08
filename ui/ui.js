@@ -2265,6 +2265,286 @@ function setAliasLabel(public_alias, labelOrNull) {
 // Network tab (Federation UI)
 // =========================
 
+const LS_NET_LABELS = "exchange_partner_labels";
+
+let __netLastStatus = null;
+let __netLastPartners = null;
+
+function requireAdminOperatorOrThrow() {
+  const k = getOperatorKeyMemOrNull();
+  if (!isAdminEnabled() || !k) {
+    throw new Error("Admin Mode not enabled (operator key missing).");
+  }
+  return k;
+}
+
+function loadNetworkLabelsMap() {
+  try {
+    const raw = localStorage.getItem(LS_NET_LABELS);
+    const obj = raw ? JSON.parse(raw) : {};
+    return (obj && typeof obj === "object") ? obj : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveNetworkLabelsMap(map) {
+  try {
+    localStorage.setItem(LS_NET_LABELS, JSON.stringify(map || {}));
+  } catch {}
+}
+
+function partnerLabelKey(partner) {
+  if (partner?.partner_id) return String(partner.partner_id);
+  if (partner?.exchange_id) return String(partner.exchange_id);
+  return "";
+}
+
+function getPartnerLabelOrNull(partner) {
+  const key = partnerLabelKey(partner);
+  if (!key) return null;
+  const m = loadNetworkLabelsMap();
+  const v = m[key];
+  return (typeof v === "string" && v.trim()) ? v.trim() : null;
+}
+
+function setPartnerLabel(partner, labelOrNull) {
+  const key = partnerLabelKey(partner);
+  if (!key) return;
+  const m = loadNetworkLabelsMap();
+  const v = String(labelOrNull || "").trim();
+  if (!v) delete m[key];
+  else m[key] = v;
+  saveNetworkLabelsMap(m);
+}
+
+function netSafeText(v, fallback = "—") {
+  const s = String(v == null ? "" : v).trim();
+  return s || fallback;
+}
+
+function netShortHash(v) {
+  const s = String(v || "").trim();
+  if (!s) return "—";
+  if (s.length <= 20) return s;
+  return `${s.slice(0, 10)}…${s.slice(-8)}`;
+}
+
+function netEscapeHtml(s) {
+  return String(s).replace(/[&<>\"']/g, (m) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    "\"": "&quot;",
+    "'": "&#039;",
+  }[m]));
+}
+
+function netCompatibilityBadgeClass(partner) {
+  const c = String(partner?.compatibility_status || "").toUpperCase();
+  if (c === "OK") return "ok";
+  if (c === "INCOMPATIBLE") return "bad";
+  return "dim";
+}
+
+function renderNetworkStatusCard(statusObj) {
+  const exchangeEl = document.getElementById("netStatusExchange");
+  const countEl = document.getElementById("netStatusPartnersCount");
+  const baseUrlEl = document.getElementById("netStatusBaseUrl");
+  const protocolEl = document.getElementById("netStatusProtocol");
+  const contractEl = document.getElementById("netStatusContract");
+  const disputesEl = document.getElementById("netStatusDisputes");
+  const pre = document.getElementById("netStatusJson");
+
+  if (pre) {
+    pre.textContent = statusObj ? JSON.stringify(statusObj, null, 2) : "";
+  }
+
+  if (!statusObj) {
+    if (exchangeEl) exchangeEl.textContent = "—";
+    if (countEl) countEl.textContent = "—";
+    if (baseUrlEl) baseUrlEl.textContent = "—";
+    if (protocolEl) protocolEl.textContent = "—";
+    if (contractEl) contractEl.textContent = "—";
+    if (disputesEl) disputesEl.textContent = "—";
+    return;
+  }
+
+  if (exchangeEl) exchangeEl.textContent = netSafeText(statusObj.exchange_id);
+  if (countEl) countEl.textContent = String(statusObj.partners_count ?? "—");
+  if (baseUrlEl) baseUrlEl.textContent = netSafeText(statusObj.canonical_base_url);
+  if (protocolEl) protocolEl.textContent = netSafeText(statusObj.protocol_version);
+  if (contractEl) contractEl.textContent = netShortHash(statusObj.contract_hash || statusObj.contract_id);
+  if (disputesEl) disputesEl.textContent = String(statusObj.disputes_open ?? "—");
+}
+
+function renderNetworkPartnersState(message) {
+  const el = document.getElementById("netPartnersState");
+  if (el) el.textContent = String(message || "");
+}
+
+function renderNetworkPartnersList(partnersObj) {
+  const list = document.getElementById("netPartnersList");
+  const pre = document.getElementById("netPartnersJson");
+  const state = document.getElementById("netPartnersState");
+
+  if (pre) {
+    pre.textContent = partnersObj ? JSON.stringify(partnersObj, null, 2) : "";
+  }
+
+  if (!list) return;
+
+  list.innerHTML = "";
+
+  const partners = Array.isArray(partnersObj?.partners) ? partnersObj.partners : [];
+
+  if (!partners.length) {
+    if (state) state.textContent = "No federation partners configured.";
+    return;
+  }
+
+  if (state) state.textContent = "";
+
+  for (const partner of partners) {
+    const card = document.createElement("div");
+    card.className = "networkPartnerCard";
+
+    const localLabel = getPartnerLabelOrNull(partner);
+    const title = localLabel || netSafeText(partner.exchange_id, "(missing exchange_id)");
+    const subtitle = localLabel ? netSafeText(partner.exchange_id) : netSafeText(partner.partner_id);
+    const compat = netSafeText(partner.compatibility_status, "UNKNOWN");
+    const compatClass = netCompatibilityBadgeClass(partner);
+    const statusText = netSafeText(partner.status, "UNKNOWN");
+
+    card.innerHTML = `
+      <div class="networkPartnerTop">
+        <div style="min-width:0; flex:1;">
+          <div class="networkPartnerTitle">${netEscapeHtml(title)}</div>
+          <div class="muted2" style="font-size:12px; margin-top:4px;">${netEscapeHtml(subtitle)}</div>
+        </div>
+        <div style="display:flex; gap:8px; flex-wrap:wrap;">
+          <span class="networkBadge ${compatClass}">${netEscapeHtml(compat)}</span>
+          <span class="networkBadge dim">${netEscapeHtml(statusText)}</span>
+        </div>
+      </div>
+
+      <div class="networkPartnerMeta">
+        <div class="networkPartnerMetaRow"><strong>Partner ID:</strong> ${netEscapeHtml(netSafeText(partner.partner_id))}</div>
+        <div class="networkPartnerMetaRow"><strong>Base URL:</strong> ${netEscapeHtml(netSafeText(partner.canonical_base_url))}</div>
+        <div class="networkPartnerMetaRow"><strong>Protocol:</strong> ${netEscapeHtml(netSafeText(partner.protocol_version))}</div>
+        <div class="networkPartnerMetaRow"><strong>Contract:</strong> ${netEscapeHtml(netSafeText(partner.contract_hash || partner.contract_id))}</div>
+        <div class="networkPartnerMetaRow"><strong>Last Seen:</strong> ${netEscapeHtml(netSafeText(partner.last_seen_at))}</div>
+        <div class="networkPartnerMetaRow"><strong>Keys:</strong> ${netEscapeHtml(String(partner.public_keys_count ?? "—"))}</div>
+        ${
+          partner?.incompatibility_reason
+            ? `<div class="networkPartnerMetaRow"><strong>Reason:</strong> ${netEscapeHtml(partner.incompatibility_reason)}</div>`
+            : ""
+        }
+        ${
+          partner?.notes
+            ? `<div class="networkPartnerMetaRow"><strong>Notes:</strong> ${netEscapeHtml(partner.notes)}</div>`
+            : ""
+        }
+      </div>
+
+      <div class="networkPartnerActions"></div>
+    `;
+
+    const actions = card.querySelector(".networkPartnerActions");
+
+    const labelBtn = document.createElement("button");
+    labelBtn.type = "button";
+    labelBtn.className = "smallBtn";
+    labelBtn.textContent = "Label";
+    labelBtn.onclick = async () => {
+      const current = getPartnerLabelOrNull(partner) || "";
+      const next = prompt(
+        `Set a local nickname for:\n${partner.exchange_id || partner.partner_id}\n\nLeave blank to clear.`,
+        current
+      );
+      if (next === null) return;
+      setPartnerLabel(partner, next);
+      renderNetworkPartnersList(__netLastPartners);
+    };
+    actions.appendChild(labelBtn);
+
+    const helloBtn = document.createElement("button");
+    helloBtn.type = "button";
+    helloBtn.className = "smallBtn";
+    helloBtn.textContent = "HELLO";
+    helloBtn.onclick = async () => {
+      try {
+        requireAdminOperatorOrThrow();
+        const out = document.getElementById("netOut");
+        if (out) out.textContent = "Sending HELLO…";
+        await federationFetch(`/federation/partners/${encodeURIComponent(String(partner.partner_id || ""))}/hello`, {
+          method: "POST",
+          headers: { "Content-Type": "text/plain" },
+        });
+        if (out) out.textContent = "HELLO sent.";
+        await netRefreshPartners();
+        await netRefreshStatus();
+      } catch (e) {
+        const out = document.getElementById("netOut");
+        if (out) out.textContent = `HELLO failed: ${String(e?.body?.error || e?.message || e)}`;
+      }
+    };
+    actions.appendChild(helloBtn);
+
+    const disableBtn = document.createElement("button");
+    disableBtn.type = "button";
+    disableBtn.className = "smallBtn";
+    disableBtn.textContent = "Disable";
+    disableBtn.onclick = async () => {
+      try {
+        requireAdminOperatorOrThrow();
+        const ok = confirm(`Disable partner ${partner.exchange_id || partner.partner_id}?`);
+        if (!ok) return;
+        const out = document.getElementById("netOut");
+        if (out) out.textContent = "Disabling partner…";
+        await federationFetch("/federation/partners/disable", {
+          method: "POST",
+          body: JSON.stringify({ partner_id: String(partner.partner_id || "") }),
+        });
+        if (out) out.textContent = "Partner disabled.";
+        await netRefreshPartners();
+        await netRefreshStatus();
+      } catch (e) {
+        const out = document.getElementById("netOut");
+        if (out) out.textContent = `Disable failed: ${String(e?.body?.error || e?.message || e)}`;
+      }
+    };
+    actions.appendChild(disableBtn);
+
+    const removeBtn = document.createElement("button");
+    removeBtn.type = "button";
+    removeBtn.className = "smallBtn";
+    removeBtn.textContent = "Remove";
+    removeBtn.onclick = async () => {
+      try {
+        requireAdminOperatorOrThrow();
+        const ok = confirm(`Remove partner ${partner.exchange_id || partner.partner_id}? This deletes the allowlist row.`);
+        if (!ok) return;
+        const out = document.getElementById("netOut");
+        if (out) out.textContent = "Removing partner…";
+        await federationFetch("/federation/partners/remove", {
+          method: "POST",
+          body: JSON.stringify({ partner_id: String(partner.partner_id || "") }),
+        });
+        if (out) out.textContent = "Partner removed.";
+        await netRefreshPartners();
+        await netRefreshStatus();
+      } catch (e) {
+        const out = document.getElementById("netOut");
+        if (out) out.textContent = `Remove failed: ${String(e?.body?.error || e?.message || e)}`;
+      }
+    };
+    actions.appendChild(removeBtn);
+
+    list.appendChild(card);
+  }
+}
+
 async function federationFetch(path, opts) {
   const k = getOperatorKeyMemOrNull();
   const headers = Object.assign({}, (opts && opts.headers) ? opts.headers : {});
@@ -2287,67 +2567,130 @@ async function federationFetch(path, opts) {
 
 async function netRefreshStatus() {
   const out = document.getElementById("netOut");
-  const pre = document.getElementById("netStatusJson");
   try {
     if (out) out.textContent = "Loading status…";
-    const j = await federationFetch("/federation/status", { method: "GET", headers: { "Content-Type": "text/plain" } });
-    if (pre) pre.textContent = JSON.stringify(j, null, 2);
+    const j = await federationFetch("/federation/status", {
+      method: "GET",
+      headers: { "Content-Type": "text/plain" },
+    });
+    __netLastStatus = j;
+    renderNetworkStatusCard(j);
     if (out) out.textContent = "Status OK.";
+    return j;
   } catch (e) {
+    renderNetworkStatusCard(null);
     if (out) out.textContent = `Status failed: ${String(e?.body?.error || e?.message || e)}`;
+    throw e;
   }
 }
 
 async function netRefreshPartners() {
   const out = document.getElementById("netOut");
-  const pre = document.getElementById("netPartnersJson");
   try {
+    renderNetworkPartnersState("Loading network…");
     if (out) out.textContent = "Loading partners…";
-    const j = await federationFetch("/federation/partners", { method: "GET", headers: { "Content-Type": "text/plain" } });
-    if (pre) pre.textContent = JSON.stringify(j, null, 2);
+    const j = await federationFetch("/federation/partners", {
+      method: "GET",
+      headers: { "Content-Type": "text/plain" },
+    });
+    __netLastPartners = j;
+    renderNetworkPartnersList(j);
+
+    if (__netLastStatus && Number(__netLastStatus.partners_count || 0) > 0) {
+      const rendered = Array.isArray(j?.partners) ? j.partners.length : 0;
+      if (rendered === 0) {
+        renderNetworkPartnersState("Partner data exists in status, but no partner rows rendered.");
+      }
+    }
+
     if (out) out.textContent = "Partners OK.";
+    return j;
   } catch (e) {
+    __netLastPartners = null;
+    renderNetworkPartnersList({ partners: [] });
+    renderNetworkPartnersState(`Could not load network state. ${String(e?.body?.error || e?.message || e)}`);
     if (out) out.textContent = `Partners failed: ${String(e?.body?.error || e?.message || e)}`;
+    throw e;
   }
 }
 
-async function netSendHello() {
-  const out = document.getElementById("netOut");
-  const url = (document.getElementById("netPartnerUrl")?.value || "").trim().replace(/\/$/, "");
-  const notes = (document.getElementById("netPartnerNotes")?.value || "").trim();
+async function netAddPartner() {
+  requireAdminOperatorOrThrow();
 
-  if (!url) {
-    if (out) out.textContent = "Enter partner base URL.";
+  const exchangeId = (document.getElementById("netAddExchangeId")?.value || "").trim();
+  const baseUrl = (document.getElementById("netAddBaseUrl")?.value || "").trim().replace(/\/$/, "");
+  const pubkey = (document.getElementById("netAddPublicKey")?.value || "").trim();
+  const notes = (document.getElementById("netAddNotes")?.value || "").trim();
+
+  const addStatus = document.getElementById("netAddStatus");
+  const out = document.getElementById("netOut");
+
+  if (!exchangeId || !baseUrl || !pubkey) {
+    if (addStatus) addStatus.textContent = "Exchange ID, base URL, and public key are required.";
     return;
   }
 
-  try {
-    if (out) out.textContent = "Sending HELLO…";
+  if (addStatus) addStatus.textContent = "Adding partner…";
+  if (out) out.textContent = "Adding partner…";
 
-    // This assumes you have an operator endpoint that triggers an outbound HELLO.
-    // If your server uses a different path, change it here to match routes.js.
-    const j = await federationFetch("/federation/partners/hello", {
-      method: "POST",
-      body: JSON.stringify({ canonical_base_url: url, notes }),
-    });
+  const payload = {
+    exchange_id: exchangeId,
+    canonical_base_url: baseUrl,
+    public_keys_b64: [pubkey],
+    notes,
+  };
 
-    if (out) out.textContent = "HELLO sent.";
-    await netRefreshPartners();
-    return j;
-  } catch (e) {
-    if (out) out.textContent = `HELLO failed: ${String(e?.body?.error || e?.message || e)}`;
-  }
+  const j = await federationFetch("/federation/partners/add", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+
+  if (addStatus) addStatus.textContent = `Partner saved (${String(j?.partner_id || "ok")}).`;
+  if (out) out.textContent = "Partner added.";
+
+  const exEl = document.getElementById("netAddExchangeId");
+  const baseEl = document.getElementById("netAddBaseUrl");
+  const keyEl = document.getElementById("netAddPublicKey");
+  const notesEl = document.getElementById("netAddNotes");
+
+  if (exEl) exEl.value = "";
+  if (baseEl) baseEl.value = "";
+  if (keyEl) keyEl.value = "";
+  if (notesEl) notesEl.value = "";
+
+  await netRefreshPartners();
+  await netRefreshStatus();
+}
+
+async function refreshNetworkUi() {
+  renderNetworkPartnersState("Loading network…");
+  await Promise.allSettled([
+    netRefreshStatus(),
+    netRefreshPartners(),
+  ]);
 }
 
 // Hook buttons once (safe even if Network tab isn't present)
 (function wireNetworkTabOnce(){
   const sBtn = document.getElementById("netRefreshStatusBtn");
   const pBtn = document.getElementById("netRefreshPartnersBtn");
-  const hBtn = document.getElementById("netSendHelloBtn");
+  const addBtn = document.getElementById("netAddPartnerBtn");
 
-  if (sBtn) sBtn.onclick = netRefreshStatus;
-  if (pBtn) pBtn.onclick = netRefreshPartners;
-  if (hBtn) hBtn.onclick = netSendHello;
+  if (sBtn) sBtn.onclick = () => { netRefreshStatus().catch(() => {}); };
+  if (pBtn) pBtn.onclick = () => { netRefreshPartners().catch(() => {}); };
+  if (addBtn) {
+    addBtn.onclick = async () => {
+      try {
+        await netAddPartner();
+      } catch (e) {
+        const addStatus = document.getElementById("netAddStatus");
+        const out = document.getElementById("netOut");
+        const msg = String(e?.body?.error || e?.message || e);
+        if (addStatus) addStatus.textContent = msg;
+        if (out) out.textContent = `Add failed: ${msg}`;
+      }
+    };
+  }
 })();
 
 // =========================
