@@ -2678,6 +2678,11 @@ async function netAddPartner() {
   await netRefreshStatus();
 }
 
+function renderNetworkPartnersState(message) {
+  const el = document.getElementById("netPartnersState");
+  if (el) el.textContent = String(message || "");
+}
+
 async function refreshNetworkUi() {
   renderNetworkPartnersState("Loading network…");
   await Promise.allSettled([
