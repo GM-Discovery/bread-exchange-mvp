@@ -1991,6 +1991,22 @@ function setAliasLabel(public_alias, labelOrNull) {
   // =========================
   // Phase 1: Tabs / page switching
   // =========================
+
+  // Refresh Network tab when opened
+  async function refreshNetworkUi() {
+    try {
+      renderNetworkPartnersState("Loading network…");
+
+      await Promise.allSettled([
+        netRefreshStatus(),
+        netRefreshPartners()
+      ]);
+
+    } catch (e) {
+      console.error("Network refresh failed:", e);
+    }
+  }
+
   function showTab(tabName) {
     // Remember current tab in memory (you already added currentTab)
     currentTab = tabName;
