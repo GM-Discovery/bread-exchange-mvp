@@ -315,24 +315,80 @@
           </div>
 
           <div class="grid" style="margin-top:12px;">
-            <label style="display:block; font-weight:600;">Partner Base URL</label>
-            <input id="netPartnerUrl" placeholder="https://exchange.example.com" />
+            <div id="netStatusCard" class="networkStatusCard">
+              <div class="networkStatusRow">
+                <div>
+                  <div class="networkStatusLabel">Exchange</div>
+                  <div id="netStatusExchange" class="networkStatusValue">—</div>
+                </div>
+                <div>
+                  <div class="networkStatusLabel">Partners</div>
+                  <div id="netStatusPartnersCount" class="networkStatusValue">—</div>
+                </div>
+              </div>
 
-            <label style="display:block; font-weight:600;">Notes</label>
-            <input id="netPartnerNotes" placeholder="optional (e.g. 'breadstandard exchange')" />
-
-            <div class="row" style="gap:10px; flex-wrap:wrap;">
-              <button id="netSendHelloBtn" type="button">Send HELLO</button>
+              <div class="networkStatusGrid">
+                <div>
+                  <div class="networkStatusLabel">Base URL</div>
+                  <div id="netStatusBaseUrl" class="networkStatusSmall">—</div>
+                </div>
+                <div>
+                  <div class="networkStatusLabel">Protocol</div>
+                  <div id="netStatusProtocol" class="networkStatusSmall">—</div>
+                </div>
+                <div>
+                  <div class="networkStatusLabel">Contract</div>
+                  <div id="netStatusContract" class="networkStatusSmall">—</div>
+                </div>
+                <div>
+                  <div class="networkStatusLabel">Disputes Open</div>
+                  <div id="netStatusDisputes" class="networkStatusSmall">—</div>
+                </div>
+              </div>
             </div>
 
-            <label style="display:block; font-weight:600; margin-top:10px;">Status JSON</label>
-            <pre id="netStatusJson" class="muted2" style="white-space:pre-wrap; overflow:auto; max-height:240px; padding:10px; border:1px solid #eee; border-radius:12px;"></pre>
+            <hr />
 
-            <label style="display:block; font-weight:600;">Partners JSON</label>
-            <pre id="netPartnersJson" class="muted2" style="white-space:pre-wrap; overflow:auto; max-height:320px; padding:10px; border:1px solid #eee; border-radius:12px;"></pre>
+            <h3 style="margin:0;">Add Partner</h3>
+            <div class="muted2" style="font-size:12px;">
+              Adds or updates an allowlisted partner using the existing operator route.
+            </div>
+
+            <label style="display:block; font-weight:600;">Exchange ID</label>
+            <input id="netAddExchangeId" placeholder="ex_..." />
+
+            <label style="display:block; font-weight:600;">Canonical Base URL</label>
+            <input id="netAddBaseUrl" placeholder="https://exchange.example.com" />
+
+            <label style="display:block; font-weight:600;">Public Key (base64)</label>
+            <textarea id="netAddPublicKey" rows="4" placeholder="Single partner public key in base64"></textarea>
+
+            <label style="display:block; font-weight:600;">Notes</label>
+            <input id="netAddNotes" placeholder="optional" />
+
+            <div class="row" style="gap:10px; flex-wrap:wrap;">
+              <button id="netAddPartnerBtn" type="button">Add Partner</button>
+              <span id="netAddStatus" class="muted"></span>
+            </div>
+
+            <hr />
+
+            <h3 style="margin:0;">Partners</h3>
+            <div id="netPartnersState" class="muted">Loading network…</div>
+            <div id="netPartnersList" class="grid"></div>
+
+            <details class="resultsAudit">
+              <summary>Status JSON</summary>
+              <pre id="netStatusJson" class="muted2" style="white-space:pre-wrap; overflow:auto; max-height:240px; padding:10px; border:1px solid #eee; border-radius:12px;"></pre>
+            </details>
+
+            <details class="resultsAudit">
+              <summary>Partners JSON</summary>
+              <pre id="netPartnersJson" class="muted2" style="white-space:pre-wrap; overflow:auto; max-height:320px; padding:10px; border:1px solid #eee; border-radius:12px;"></pre>
+            </details>
           </div>
         </div>
-      </section>    
+      </section>
 <h3 style="margin-top:6px;">Admin Mode</h3>
 <div class="muted2" style="font-size:12px; margin-bottom:10px;">
   Admin Mode is session-only. Operator key is kept in memory and not saved.
