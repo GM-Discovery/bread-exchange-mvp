@@ -1942,6 +1942,18 @@ function setAliasLabel(public_alias, labelOrNull) {
     }
   }
 
+  async function refreshNetworkUi() {
+    try {
+      renderNetworkPartnersState("Loading network…");
+      await Promise.allSettled([
+        netRefreshStatus(),
+        netRefreshPartners()
+      ]);
+    } catch (e) {
+      console.error("Network refresh failed:", e);
+    }
+  }
+
   // =========================
   // Phase 1: Tabs / page switching
   // =========================
