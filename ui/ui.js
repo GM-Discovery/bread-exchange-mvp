@@ -1974,7 +1974,7 @@ function setAliasLabel(public_alias, labelOrNull) {
     if (tabNetwork) tabNetwork.classList.toggle("active", tabName === "network");
 
     if (tabName === "network") {
-      try { window.__refreshNetworkUi(); } catch (e) { console.warn(e); }
+      window.dispatchEvent(new Event("network:refresh"));
     }
 
     // When entering Settings, refresh trust summary (signed).
@@ -2635,6 +2635,12 @@ function wireNetworkTabOnce(){
     };
   }
 };
+
+let __networkWired = false;
+window.addEventListener("network:refresh", () => {
+  if (!__networkWired) { wireNetworkTabOnce(); __networkWired = true; }
+  refreshNetworkUi().catch(e => console.warn(e));
+});
 
 // =========================
 // Settings: Admin Mode (session-only operator key)
