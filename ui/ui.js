@@ -37,52 +37,6 @@ function __uiStaticTripwireOrAbort() {
 }
 // --- end UI SHIP TRIPWIRE ---
 
-(function () {
-  try {
-    let n = 0;
-    document.addEventListener("click", (e) => {
-      n++;
-      const t = e.target && e.target.id ? `#${e.target.id}` : (e.target && e.target.tagName ? e.target.tagName : "unknown");
-      console.log("UI_CLICK", n, t);
-
-      // Update / create a badge
-      let b = document.getElementById("uiClickMarker");
-      if (!b) {
-        b = document.createElement("div");
-        b.id = "uiClickMarker";
-        b.style.cssText = "position:fixed;bottom:8px;right:8px;z-index:999999;background:#111;color:#fff;padding:6px 10px;border-radius:8px;font:12px/1.2 system-ui;opacity:.9";
-        document.addEventListener("DOMContentLoaded", () => document.body.appendChild(b));
-        if (document.body) document.body.appendChild(b);
-      }
-      b.textContent = `Clicks seen: ${n} (${t})`;
-    }, true); // capture phase: sees clicks even if something stops bubbling
-  } catch (_) {}
-})();
-(function () {
-  try {
-    const d = document.createElement("div");
-    d.id = "uiBootMarker";
-    d.textContent = "UI JS loaded ✅";
-    d.style.cssText = "position:fixed;bottom:8px;left:8px;z-index:999999;background:#111;color:#fff;padding:6px 10px;border-radius:8px;font:12px/1.2 system-ui;opacity:.9";
-    document.addEventListener("DOMContentLoaded", () => document.body.appendChild(d));
-  } catch (_) {}
-})();
-window.addEventListener("error", (e) => {
-  try {
-    const d = document.createElement("div");
-    d.textContent = "UI ERROR: " + (e && e.message ? e.message : "unknown");
-    d.style.cssText = "position:fixed;bottom:44px;left:8px;z-index:999999;background:#8b0000;color:#fff;padding:6px 10px;border-radius:8px;font:12px/1.2 system-ui;opacity:.95";
-    document.body.appendChild(d);
-  } catch (_) {}
-});
-window.addEventListener("unhandledrejection", (e) => {
-  try {
-    const d = document.createElement("div");
-    d.textContent = "UI REJECTION: " + (e && e.reason ? String(e.reason) : "unknown");
-    d.style.cssText = "position:fixed;bottom:80px;left:8px;z-index:999999;background:#8b0000;color:#fff;padding:6px 10px;border-radius:8px;font:12px/1.2 system-ui;opacity:.95";
-    document.body.appendChild(d);
-  } catch (_) {}
-});
 (() => {
   "use strict";
 
@@ -119,9 +73,9 @@ function setAdminEnabled(enabled) {
   if (status) status.textContent = __adminEnabled ? "Admin mode enabled." : "Admin mode inactive.";
 }
 
-  // =========================
-  // Storage keys
-  // =========================
+// =========================
+// Storage keys
+// =========================
   const LS_API = "breadpoll_api";
   const LS_TOKENS = "breadpoll_tokens"; // poll_id -> voter_token (device-local)
   const LS_LOCAL_POLLS = "breadpoll_local_polls_v1"; // array of poll objects
@@ -1450,7 +1404,7 @@ function setAliasLabel(public_alias, labelOrNull) {
 
       // Remote stream (optional)
       try {
-        es = new EventSource(`${EXCHANGE_API}/polls/stream`);
+        es = new EventSource(`${EXCHANGE_API}/polls/${encodeURIComponent(String(pollId))}/stream`);
         es.addEventListener("poll", async (ev) => {
           try {
             const obj = JSON.parse(ev.data);
@@ -1992,21 +1946,6 @@ function setAliasLabel(public_alias, labelOrNull) {
   // Phase 1: Tabs / page switching
   // =========================
 
-  // Refresh Network tab when opened
-  async function refreshNetworkUi() {
-    try {
-      renderNetworkPartnersState("Loading network…");
-
-      await Promise.allSettled([
-        netRefreshStatus(),
-        netRefreshPartners()
-      ]);
-
-    } catch (e) {
-      console.error("Network refresh failed:", e);
-    }
-  }
-
   function showTab(tabName) {
     // Remember current tab in memory (you already added currentTab)
     currentTab = tabName;
@@ -2060,23 +1999,6 @@ function setAliasLabel(public_alias, labelOrNull) {
     if (listCard) listCard.style.display = "none";
     if (pollView) pollView.style.display = "block";
     inPollDetail = true;
-  }
-
-
-  function showPollDetail() {
-    const listCard = document.getElementById("pollsListCard");
-    const pollView = document.getElementById("pollView");
-    if (listCard) listCard.style.display = "none";
-    if (pollView) pollView.style.display = "block";
-    inPollDetail = true;
-  }
-
-  function showPollList() {
-    const listCard = document.getElementById("pollsListCard");
-    const pollView = document.getElementById("pollView");
-    if (listCard) listCard.style.display = "block";
-    if (pollView) pollView.style.display = "none";
-    inPollDetail = false;
   }
 
   // =========================
@@ -2692,7 +2614,7 @@ async function refreshNetworkUi() {
 }
 
 // Hook buttons once (safe even if Network tab isn't present)
-(function wireNetworkTabOnce(){
+function wireNetworkTabOnce(){
   const sBtn = document.getElementById("netRefreshStatusBtn");
   const pBtn = document.getElementById("netRefreshPartnersBtn");
   const addBtn = document.getElementById("netAddPartnerBtn");
@@ -2712,7 +2634,7 @@ async function refreshNetworkUi() {
       }
     };
   }
-})();
+};
 
 // =========================
 // Settings: Admin Mode (session-only operator key)
@@ -3248,6 +3170,9 @@ if (delegationRefreshBtn) {
     
     // Default view on startup
     showTab(currentTab || "polls");
+
+    // Wire network tab buttons (deferred from outer scope so DOM exists)
+    wireNetworkTabOnce();
 
     if (backToListBtn) {
       backToListBtn.onclick = () => {

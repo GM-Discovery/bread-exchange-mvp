@@ -1,35 +1,10 @@
-
-
-
-
-You said:
-
-
-
-Can you combine these three files into one, remove any redundancy and make it flow as one document without cutting any material that isn't duplicative?
-
-ChatGPT said:
-Below is a single unified document that merges:
-
-
-OPERATOR_NOTES.updated
-
-
-
-OPERATOR_NOTES
-
-
-
-OPERATOR_NOTES.3
-
-
 All redundant sections have been consolidated.
 No non-duplicative material has been removed.
 Contradictions (Basic Auth vs HMAC) have been resolved in favor of the current security model.
 
 You can paste this directly into OPERATOR_NOTES.md.
 
-Bread Exchange / Poll Stack — Unified Operator & Maintainer Notes
+Bread Exchange / Poll Stack ï¿½ Unified Operator & Maintainer Notes
 1) Scope and Purpose
 This document describes how the Bread Exchange backend operates, how it is deployed, how it is secured, and how to safely rebuild, test, and reason about it.
 
@@ -57,14 +32,14 @@ Frontend behavior is intentionally out of scope unless explicitly noted.
 
 2) Repository, Paths, and Layout
 Host Paths
-/opt/bread-exchange-mvp/ — Exchange repository root
+/opt/bread-exchange-mvp/ ï¿½ Exchange repository root
 
-/opt/bread-exchange-mvp/data/ — Repo copies (NOT authoritative at runtime)
+/opt/bread-exchange-mvp/data/ ï¿½ Repo copies (NOT authoritative at runtime)
 
 Container Paths
-/app/ — Application code (baked into image)
+/app/ ï¿½ Application code (baked into image)
 
-/app/data/ — Persistent JSON state (bind-mounted, authoritative)
+/app/data/ ï¿½ Persistent JSON state (bind-mounted, authoritative)
 
 Authoritative Data Mount (Example)
 Host:
@@ -78,34 +53,34 @@ Always inspect the mounted host directory backing /app/data.
 Never assume repo /data reflects runtime state.
 
 3) Key Code Files
-server.js — Core routing, authority logic, weighted voting, ballot UID derivation, snapshot persistence
+server.js ï¿½ Core routing, authority logic, weighted voting, ballot UID derivation, snapshot persistence
 
-lib/lifecycle.js — Poll lifecycle transitions (open ? close ? cooldown ? finalize ? publish)
+lib/lifecycle.js ï¿½ Poll lifecycle transitions (open ? close ? cooldown ? finalize ? publish)
 
-config.js — Centralized configuration defaults and fingerprinting
+config.js ï¿½ Centralized configuration defaults and fingerprinting
 
 4) Runtime Data Files (/app/data)
-exchange.private.json — Polls, votes, snapshots
+exchange.private.json ï¿½ Polls, votes, snapshots
 
-identity.private.json — Personas, stamps
+identity.private.json ï¿½ Personas, stamps
 
-identity.state.json — Current identity state (weights, aliases)
+identity.state.json ï¿½ Current identity state (weights, aliases)
 
-identity.ledger.json — Append-only identity events
+identity.ledger.json ï¿½ Append-only identity events
 
-delegation.private.json — Delegation edges
+delegation.private.json ï¿½ Delegation edges
 
-identity.signing.private.json — Signing keys (Security v0)
+identity.signing.private.json ï¿½ Signing keys (Security v0)
 
-federation.identity.private.json — Ed25519 keypair (private)
+federation.identity.private.json ï¿½ Ed25519 keypair (private)
 
-federation.partners.json — Allowlisted partners
+federation.partners.json ï¿½ Allowlisted partners
 
-federation.local_commitments.json — Local finalization commitments
+federation.local_commitments.json ï¿½ Local finalization commitments
 
-federation.commitments.json — Received commitments + match state
+federation.commitments.json ï¿½ Received commitments + match state
 
-federation.disputes.json — Challenge/proof transcripts
+federation.disputes.json ï¿½ Challenge/proof transcripts
 
 5) Deployment Model (Critical)
 Application code is baked into the Docker image.
@@ -208,7 +183,7 @@ Operator keys
 
 Salts or credentials
 
-Security v0 — Signed Requests (HMAC) + Operator Key
+Security v0 ï¿½ Signed Requests (HMAC) + Operator Key
 Overview
 Caddy Basic Auth has been removed.
 
@@ -258,7 +233,7 @@ SHA256(body)
 HMAC-SHA256 with signing_key.
 
 Replay Defense
-±5 minute timestamp window
+ï¿½5 minute timestamp window
 
 Nonce cache with TTL
 
@@ -300,7 +275,7 @@ Valid:
 200 OK
 Fail-closed by design.
 
-Federation v0 — Partner Allowlisted Commitments
+Federation v0 ï¿½ Partner Allowlisted Commitments
 Exchange supports signed commitments on poll finalization.
 
 Required Env
@@ -354,7 +329,7 @@ Exec
 docker exec -it bread-exchange sh
 Health
 wget -qO- http://127.0.0.1:8787/api/health
-2026-02-14 — 403 Vote Loop Resolution
+2026-02-14 ï¿½ 403 Vote Loop Resolution
 Symptom
 Intermittent 403
 
@@ -408,8 +383,6 @@ Only /app/data is authoritative.
 All application logic is baked into the Docker image.
 Rebuild after code changes.
 Verify container contents before debugging behavior.
-
-
 
 ## Static UI Contract (frontend deploy)
 
