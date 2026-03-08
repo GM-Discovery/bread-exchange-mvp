@@ -1942,18 +1942,6 @@ function setAliasLabel(public_alias, labelOrNull) {
     }
   }
 
-  async function refreshNetworkUi() {
-    try {
-      renderNetworkPartnersState("Loading network…");
-      await Promise.allSettled([
-        netRefreshStatus(),
-        netRefreshPartners()
-      ]);
-    } catch (e) {
-      console.error("Network refresh failed:", e);
-    }
-  }
-
   // =========================
   // Phase 1: Tabs / page switching
   // =========================
@@ -1986,7 +1974,7 @@ function setAliasLabel(public_alias, labelOrNull) {
     if (tabNetwork) tabNetwork.classList.toggle("active", tabName === "network");
 
     if (tabName === "network") {
-      try { refreshNetworkUi(); } catch (e) { console.warn(e); }
+      try { window.__refreshNetworkUi(); } catch (e) { console.warn(e); }
     }
 
     // When entering Settings, refresh trust summary (signed).
