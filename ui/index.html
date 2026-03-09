@@ -16,7 +16,7 @@
 
   <!-- QR library (static deploy): /vendor/qrcode.min.js -->
   <script src="/vendor/qrcode.min.js"></script>
-<link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/styles.css">
 </head>
 
 <body>
@@ -26,11 +26,9 @@
       <!-- Top header + global nav (always visible) -->
       <div class="topbar" style="align-items:flex-start;">
         <div style="flex:1;">
-          <!-- Small brand/title -->
           <h1 style="margin:0; font-size:16px; font-weight:800; line-height:1.1;">Helm Poll</h1>
           <div class="muted" style="font-size:12px; margin-top:6px;">Create → Vote → Share → Live results.</div>
 
-          <!-- Global tabs (always visible) -->
           <div class="pills" id="globalTabs" style="margin-top:12px;">
             <button id="tabCreate" class="pill active" type="button" data-tab="create" style="width:auto;">Create Poll</button>
             <button id="tabPolls" class="pill" type="button" data-tab="polls" style="width:auto;">Polls</button>
@@ -39,7 +37,6 @@
           </div>
         </div>
 
-        <!-- Share stays global (behavior unchanged; JS decides what it shares) -->
         <button id="shareBtn" class="btn-small btn-ghost" type="button" style="height:42px; width:auto;">Share</button>
       </div>
 
@@ -47,7 +44,6 @@
       <!-- PAGE: CREATE (Home)       -->
       <!-- ========================= -->
       <section id="viewCreate">
-        <!-- Advanced settings hidden unless ?settings=1 -->
         <div class="card" id="apiCard" style="display:none;">
           <div class="row">
             <label class="muted" style="min-width:180px;">Advanced settings</label>
@@ -57,7 +53,6 @@
           </div>
         </div>
 
-        <!-- Create -->
         <div class="card" id="createCard">
           <h2 style="margin-bottom:6px;">Create</h2>
           <div class="muted2" style="font-size:12px; margin-bottom:12px;">Make a poll, then share the link or QR.</div>
@@ -85,10 +80,7 @@
               Allow anonymous voting
             </label>
 
-            <!-- Success / status output (existing) -->
             <div id="createOut" class="muted"></div>
-
-            <!-- Optional: “Go to Polls” button after create (JS decides when to show) -->
             <button id="goToPolls" type="button" class="btn-ghost" style="display:none;">Go to Polls</button>
           </div>
         </div>
@@ -99,7 +91,6 @@
       <!-- ========================= -->
       <section id="viewPolls" style="display:none;">
 
-        <!-- Poll List View -->
         <div class="card" id="pollsListCard">
           <div class="topbar">
             <div>
@@ -117,22 +108,17 @@
             No polls yet. Create one in Create Poll.
           </div>
 
-          <!-- Make the list scrollable without theme work -->
           <div style="margin-top:12px; max-height:60vh; overflow:auto;">
             <div id="pollList" class="grid"></div>
           </div>
         </div>
 
-        <!-- Poll Detail View (Single Poll) -->
         <div class="card" id="pollView" style="display:none;">
           <div class="row" style="justify-content:space-between; width:100%;">
             <div style="display:flex; flex-direction:column; gap:6px; min-width: 60%;">
               <h2 id="pollTitle" style="margin:0;"></h2>
-
-              <!-- Prominent status line (JS populates #pollMeta today; keep ID, but give it room) -->
               <div class="muted" id="pollMeta" style="margin-top:6px; font-size:14px;"></div>
 
-              <!-- Vote status / stranded banner (UI-only) -->
               <div id="pollStatusBanner" style="display:none; margin-top:10px; padding:10px 12px; border-radius:12px; border:1px solid rgba(0,0,0,0.12); background:rgba(255, 235, 205, 0.35);">
                 <div id="pollStatusText" style="font-size:13px; line-height:1.35;"></div>
                 <div class="row" style="gap:10px; flex-wrap:wrap; margin-top:10px;">
@@ -140,18 +126,14 @@
                   <button id="clearRevoteTokenBtn" type="button" class="btn-small btn-ghost" style="width:auto; height:36px;">Clear revote token (debug)</button>
                 </div>
               </div>
-
             </div>
 
             <div class="row" style="justify-content:flex-end;">
-              <!-- Back control required -->
               <button id="backToList" type="button" class="btn-small btn-ghost" style="width:auto; height:42px;">Back to list</button>
-              <!-- Existing close button retained -->
               <button id="closePoll" type="button" class="btn-small btn-ghost" style="width:auto; height:42px;">Close</button>
             </div>
           </div>
 
-          <!-- Description (if present). JS can fill this, or ignore if it already uses pollMeta. -->
           <div id="pollDescription" class="muted2" style="margin-top:12px; display:none;"></div>
 
           <hr />
@@ -162,10 +144,7 @@
 
           <h3 style="margin-top:16px;">Results</h3>
 
-          <!-- Human-readable results (weighted-first) -->
           <div id="resultsPretty">
-
-            <!-- Headline card -->
             <div class="resultsHeadline">
               <div class="resultsHeadlineTop">
                 <div class="resultsHeadlineTitle">Results</div>
@@ -185,7 +164,6 @@
                   <div class="resultsStatLabel">People voted</div>
                   <div id="resultsPeople" class="resultsStatValue">—</div>
                 </div>
-
                 <div class="resultsStat">
                   <div class="resultsStatLabel">Ballots stored</div>
                   <div id="resultsBallots" class="resultsStatValue">—</div>
@@ -195,17 +173,13 @@
               <div id="resultsDebug" class="muted" style="margin-top:8px;"></div>
             </div>
 
-            <!-- Option rows -->
             <div id="resultsRows" class="resultsRows"></div>
 
-            <!-- Audit / JSON (collapsed by default) -->
             <details class="resultsAudit">
               <summary>Details / Audit JSON</summary>
               <pre id="resultsBox">{}</pre>
             </details>
-
           </div>
-
 
           <div class="muted" style="margin-top:12px;">
             Link: <a id="shareLink" href="#" target="_blank" rel="noreferrer"></a>
@@ -214,9 +188,8 @@
 
           <hr />
 
-          <!-- Assert moved into Poll Detail (required) -->
           <button id="assertBtn" type="button">Assert to Exchange</button>
-          <div id="assertStatus" class="muted" style="margin-top:8px;"></div>
+          <div id="assertStatus" class="muted" style="margin-top:8px;">
             Votes are not counted unless asserted to an "Exchange."
           </div>
           <div id="assertOut"></div>
@@ -227,7 +200,7 @@
       <!-- ========================= -->
       <!-- PAGE: SETTINGS / IDENTITY -->
       <!-- ========================= -->
-      <section id="viewSettings" style="display:none;">
+      <section id="viewSettings" style="display:none; max-width:480px; margin:0 auto;">
         <div class="card" id="settingsCard">
           <h2 style="margin-bottom:6px;">Settings / Identity</h2>
           <div class="muted2" style="font-size:12px; margin-bottom:12px;">
@@ -267,7 +240,7 @@
           <hr />
 
           <div id="exchangeStatus" class="muted" style="margin-top:10px;"></div>
-          
+
           <div class="row" style="gap:10px; flex-wrap:wrap; margin-top:10px;">
             <div class="card" style="padding:10px; min-width:160px;">
               <div class="muted2" style="font-size:12px;">TRUST POINTS</div>
@@ -282,9 +255,7 @@
               <div id="statDelegatedTrust" style="font-size:18px; font-weight:600;">—</div>
             </div>
           </div>
-          
 
-          
           <div class="row" style="gap:10px; flex-wrap:wrap; margin-top:10px;">
             <div class="card" style="padding:10px; min-width:160px;">
               <div class="muted2" style="font-size:12px;">Outbound Delegated</div>
@@ -299,7 +270,99 @@
               <div id="statDelegatedAvailable" style="font-size:18px; font-weight:600;">—</div>
             </div>
           </div>
-      <section id="viewNetwork" style="display:none;">
+
+          <hr />
+
+          <h3 style="margin-top:6px;">Admin Mode</h3>
+          <div class="muted2" style="font-size:12px; margin-bottom:10px;">
+            Admin Mode is session-only. Operator key is kept in memory and not saved.
+          </div>
+
+          <div class="row" style="gap:10px; flex-wrap:wrap; align-items:center;">
+            <input id="operatorKeyInput" type="password" placeholder="Operator key (session only)" style="min-width:260px;" />
+            <button id="adminToggleBtn" type="button" class="btn-ghost">Enable Admin Mode</button>
+            <span id="adminStatus" class="muted"></span>
+          </div>
+
+          <div id="adminOnlySection" style="display:none; margin-top:14px;">
+            <div class="row" style="gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:10px;">
+              <span class="pill" style="background:#ffefe0; color:#7a3b00; border:1px solid #ffcfad; padding:2px 8px; border-radius:999px; font-size:12px;">
+                Admin Enabled
+              </span>
+              <span class="muted2" style="font-size:12px;">
+                Trust grants and debug tools are visible only in Admin Mode.
+              </span>
+            </div>
+
+            <h3 style="margin-top:6px;">Stamps (Debug)</h3>
+            <div class="muted2" style="font-size:12px; margin-bottom:10px;">
+              Stamp tokens are hidden. No manual minting is exposed here; only purge is available for debugging.
+            </div>
+
+            <div class="row" style="gap:10px; flex-wrap:wrap;">
+              <button id="clearStampsBtn" type="button" class="btn-ghost">Purge Stamps (Debug)</button>
+              <span id="stampStatus" class="muted"></span>
+            </div>
+
+            <hr />
+
+            <h3 style="margin-top:6px;">Trust Admin</h3>
+            <div class="muted2" style="font-size:12px; margin-bottom:10px;">
+              Grant or revoke earned trust for a public alias. Requires Operator Key.
+            </div>
+
+            <div class="row" style="gap:10px; flex-wrap:wrap; align-items:center;">
+              <input id="trustTargetAliasInput" type="text" placeholder="Target public_alias (a_...)" style="min-width:220px;" />
+              <input id="trustDeltaInput" type="number" step="1" placeholder="Delta (e.g. 1 or -1)" style="width:160px;" />
+              <input id="trustReasonInput" type="text" placeholder="Reason" style="min-width:260px;" />
+              <button id="trustApplyBtn" type="button">Apply</button>
+            </div>
+
+            <div id="trustStatus" class="muted" style="margin-top:8px;"></div>
+          </div>
+
+          <hr />
+
+          <h3 style="margin-top:6px;">Delegation</h3>
+          <div class="muted2" style="font-size:12px; margin-bottom:10px;">
+            Delegate some of your trust to another public alias (outbound delegation).
+          </div>
+
+          <div class="grid">
+            <div class="row">
+              <label class="muted" style="min-width:140px;">Delegatee alias</label>
+              <input id="delegateeAliasInput" placeholder="a_..." />
+            </div>
+
+            <div class="row">
+              <label class="muted" style="min-width:140px;">Amount</label>
+              <input id="delegateAmountInput" placeholder="1" inputmode="numeric" />
+            </div>
+
+            <div class="row" style="gap:10px; flex-wrap:wrap;">
+              <button id="delegationSetBtn" type="button">Set / Update Delegation</button>
+              <button id="delegationRevokeBtn" type="button" class="btn-ghost">Revoke Delegation</button>
+            </div>
+
+            <div id="delegationStatus" class="muted"></div>
+
+            <div style="margin-top:14px;">
+              <div style="display:flex; align-items:center; justify-content:space-between; gap:10px;">
+                <h4 style="margin:0;">Outbound Delegations</h4>
+                <button id="delegationRefreshBtn" type="button" class="btn-ghost" style="padding:6px 10px;">Refresh</button>
+              </div>
+              <div id="delegationOutboundStatus" class="muted" style="margin-top:6px;"></div>
+              <div id="delegationOutboundList" class="grid" style="margin-top:8px;"></div>
+            </div>
+          </div>
+
+        </div>
+      </section>
+
+      <!-- ========================= -->
+      <!-- PAGE: NETWORK             -->
+      <!-- ========================= -->
+      <section id="viewNetwork" style="display:none; max-width:480px; margin:0 auto;">
         <div class="card">
           <h2 style="margin:0;">Network</h2>
           <div class="muted2" style="font-size:12px; margin-top:6px;">
@@ -389,97 +452,8 @@
           </div>
         </div>
       </section>
-<h3 style="margin-top:6px;">Admin Mode</h3>
-<div class="muted2" style="font-size:12px; margin-bottom:10px;">
-  Admin Mode is session-only. Operator key is kept in memory and not saved.
-</div>
 
-<div class="row" style="gap:10px; flex-wrap:wrap; align-items:center;">
-  <input id="operatorKeyInput" type="password" placeholder="Operator key (session only)" style="min-width:260px;" />
-  <button id="adminToggleBtn" type="button" class="btn-ghost">Enable Admin Mode</button>
-  <span id="adminStatus" class="muted"></span>
-</div>
-
-<div id="adminOnlySection" style="display:none; margin-top:14px;">
-  <div class="row" style="gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:10px;">
-    <span class="pill" style="background:#ffefe0; color:#7a3b00; border:1px solid #ffcfad; padding:2px 8px; border-radius:999px; font-size:12px;">
-      Admin Enabled
-    </span>
-    <span class="muted2" style="font-size:12px;">
-      Trust grants and debug tools are visible only in Admin Mode.
-    </span>
-  </div>
-
-  <h3 style="margin-top:6px;">Stamps (Debug)</h3>
-  <div class="muted2" style="font-size:12px; margin-bottom:10px;">
-    Stamp tokens are hidden. No manual minting is exposed here; only purge is available for debugging.
-  </div>
-
-  <div class="row" style="gap:10px; flex-wrap:wrap;">
-    <button id="clearStampsBtn" type="button" class="btn-ghost">Purge Stamps (Debug)</button>
-    <span id="stampStatus" class="muted"></span>
-  </div>
-
-  <hr />
-
-  <h3 style="margin-top:6px;">Trust Admin</h3>
-  <div class="muted2" style="font-size:12px; margin-bottom:10px;">
-    Grant or revoke earned trust for a public alias. Requires Operator Key.
-  </div>
-
-  <div class="row" style="gap:10px; flex-wrap:wrap; align-items:center;">
-    <input id="trustTargetAliasInput" type="text" placeholder="Target public_alias (a_...)" style="min-width:220px;" />
-    <input id="trustDeltaInput" type="number" step="1" placeholder="Delta (e.g. 1 or -1)" style="width:160px;" />
-    <input id="trustReasonInput" type="text" placeholder="Reason" style="min-width:260px;" />
-    <button id="trustApplyBtn" type="button">Apply</button>
-  </div>
-
-  <div id="trustStatus" class="muted" style="margin-top:8px;"></div>
-</div>
-
-<hr />
-
-          <h3 style="margin-top:6px;">Delegation</h3>
-          <div class="muted2" style="font-size:12px; margin-bottom:10px;">
-            Delegate some of your trust to another public alias (outbound delegation).
-          </div>
-
-          <div class="grid">
-            <div class="row">
-              <label class="muted" style="min-width:140px;">Delegatee alias</label>
-              <input id="delegateeAliasInput" placeholder="a_..." />
-            </div>
-
-            <div class="row">
-              <label class="muted" style="min-width:140px;">Amount</label>
-              <input id="delegateAmountInput" placeholder="1" inputmode="numeric" />
-            </div>
-
-            <div class="row" style="gap:10px; flex-wrap:wrap;">
-              <button id="delegationSetBtn" type="button">Set / Update Delegation</button>
-              <button id="delegationRevokeBtn" type="button" class="btn-ghost">Revoke Delegation</button>
-            </div>
-
-            <div id="delegationStatus" class="muted"></div>
-          
-          <div style="margin-top:14px;">
-            <div style="display:flex; align-items:center; justify-content:space-between; gap:10px;">
-              <h4 style="margin:0;">Outbound Delegations</h4>
-              <button id="delegationRefreshBtn" type="button" class="btn-ghost" style="padding:6px 10px;">Refresh</button>
-            </div>
-            <div id="delegationOutboundStatus" class="muted" style="margin-top:6px;"></div>
-            <div id="delegationOutboundList" class="grid" style="margin-top:8px;"></div>
-          </div>
-</div>
-
-          <hr />
-          <hr />
-
-          
-        </div>
-      </section>
-
-      <!-- QR Share Modal (unchanged) -->
+      <!-- QR Share Modal -->
       <div id="qrModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.45); padding:24px; z-index:9999;">
         <div style="max-width:420px; margin:10vh auto; background:#fff; border-radius:16px; padding:18px; box-shadow:0 10px 30px rgba(0,0,0,0.18);">
           <div class="row" style="justify-content:space-between; align-items:center;">
