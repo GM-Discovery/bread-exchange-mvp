@@ -108,7 +108,7 @@ function setAdminEnabled(enabled) {
   let es = null; // EventSource (remote live stream only)
   let currentPollId = null;
   let quill = null; // optional Quill instance
-  let currentTab = "create";   // "create" | "polls" | "settings" | "network"
+  let currentTab = "polls";   // "create" | "polls" | "settings" | "network"
   let inPollDetail = false;   // true when viewing a single poll
 
 
@@ -1982,6 +1982,9 @@ function setAliasLabel(public_alias, labelOrNull) {
       // Fire-and-forget; UI will show status if possible.
       const exchangeStatus = document.getElementById("exchangeStatus");
       refreshTrustVisibilityUi(exchangeStatus);
+      if (settingsModal && !localStorage.getItem(LS_SETTINGS_SEEN)) {
+        settingsModal.style.display = "block";
+      }
     }
   }
 
@@ -2100,6 +2103,20 @@ function setAliasLabel(public_alias, labelOrNull) {
       };
     }
     
+    // =========================
+    // Settings first-visit popup
+    // =========================
+    const LS_SETTINGS_SEEN = "helm_settings_seen";
+    const settingsModal = document.getElementById("settingsModal");
+    const settingsDismiss = document.getElementById("settingsDismiss");
+
+    if (settingsDismiss) {
+      settingsDismiss.onclick = () => {
+        localStorage.setItem(LS_SETTINGS_SEEN, "1");
+        if (settingsModal) settingsModal.style.display = "none";
+      };
+    }
+
     // =========================
     // Settings: Identity wiring (device-local)
     // =========================

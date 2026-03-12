@@ -492,7 +492,16 @@
           <button id="welcomeDismiss" type="button" style="margin-top:14px;">Got it</button>
         </div>
       </div>
-
+      <!-- Settings first-visit modal -->
+      <div id="settingsModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.55); padding:24px; z-index:9999;">
+        <div style="max-width:420px; margin:12vh auto; background:var(--panel); border:1px solid var(--stroke); border-radius:var(--r-xl); padding:20px; box-shadow:var(--shadow);">
+          <h2 style="margin:0 0 12px 0;">About Your Identity</h2>
+          <p style="font-size:14px; line-height:1.5; color:var(--muted);">
+            Pseudonymous means administrators <strong style="color:var(--text);">CANNOT RECOVER PROFILES</strong> without your "key" — so keep your Recovery Code and public alias safe somewhere on your computer, or print and put in a lockbox, or whatever you consider safe enough.
+          </p>
+          <button id="settingsDismiss" type="button" style="margin-top:14px;">I understand</button>
+        </div>
+      </div>
     </div>
   </div>
 
