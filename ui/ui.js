@@ -2083,6 +2083,24 @@ function setAliasLabel(public_alias, labelOrNull) {
     }
 
     // =========================
+    // First-visit welcome popup
+    // =========================
+    const LS_WELCOME_SEEN = "helm_welcome_seen";
+    const welcomeModal = document.getElementById("welcomeModal");
+    const welcomeDismiss = document.getElementById("welcomeDismiss");
+
+    if (welcomeModal && !localStorage.getItem(LS_WELCOME_SEEN)) {
+      welcomeModal.style.display = "block";
+    }
+
+    if (welcomeDismiss) {
+      welcomeDismiss.onclick = () => {
+        localStorage.setItem(LS_WELCOME_SEEN, "1");
+        if (welcomeModal) welcomeModal.style.display = "none";
+      };
+    }
+    
+    // =========================
     // Settings: Identity wiring (device-local)
     // =========================
     const identityDisplayNameEl = document.getElementById("identityDisplayName");
