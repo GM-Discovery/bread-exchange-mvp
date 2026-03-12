@@ -3,19 +3,31 @@ set -euo pipefail
 
 # Bread Exchange — auto-update checker
 # Runs via cron (daily). Fetches tags, verifies GPG signature against
-# allowlist, checks out new tag, rebuilds containers.
+# allowlist. By default only notifies; applies automatically if
+# AUTO_APPLY=true is set in .env.
 #
-# Install:
-#   cp tools/auto-update.sh /opt/bread-exchange-mvp/tools/
-#   chmod +x /opt/bread-exchange-mvp/tools/auto-update.sh
-#   crontab -e
-#   # Add: 0 3 * * * /opt/bread-exchange-mvp/tools/auto-update.sh >> /var/log/bread-update.log 2>&1
+# Modes:
+#   notify (default) — logs availability, writes flag file
+#   auto-apply       — checks out new tag, rebuilds containers
+#
+# Manual apply (when in notify mode):
+#   cd /opt/bread-exchange-mvp && git fetch --tags origin && git checkout -f <tag>
+#   docker compose up -d --build --force-recreate
 
 INSTALL_DIR="${BREAD_INSTALL_DIR:-/opt/bread-exchange-mvp}"
+ENV_FILE="${INSTALL_DIR}/.env"
+FLAG_FILE="/var/log/bread-update-available"
 LOG_PREFIX="[bread-update $(date -u '+%Y-%m-%dT%H:%M:%SZ')]"
 
 log()  { echo "$LOG_PREFIX $*"; }
 fail() { log "FAIL: $*" >&2; exit 1; }
+
+# --- load config from .env ---
+AUTO_APPLY="false"
+if [[ -f "$ENV_FILE" ]]; then
+  _val="$(grep -E '^AUTO_APPLY=' "$ENV_FILE" | tail -n1 | cut -d= -f2 | tr -d '[:space:]')"
+  [[ "$_val" == "true" ]] && AUTO_APPLY="true"
+fi
 
 # --- sanity checks ---
 [[ -d "$INSTALL_DIR/.git" ]] || fail "$INSTALL_DIR is not a git repo"
@@ -36,7 +48,7 @@ fi
 
 # --- current state ---
 CURRENT_TAG="$(git describe --tags --exact-match HEAD 2>/dev/null || echo "untagged")"
-log "Current tag: $CURRENT_TAG"
+log "Current: $CURRENT_TAG | Mode: $([ "$AUTO_APPLY" = "true" ] && echo "auto-apply" || echo "notify")"
 
 # --- fetch tags ---
 if ! git fetch --tags --force --prune origin >/dev/null 2>&1; then
@@ -49,6 +61,7 @@ LATEST_TAG="$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' | sort -V | tail -n 1)"
 
 if [[ "$LATEST_TAG" == "$CURRENT_TAG" ]]; then
   log "Already on latest tag ($CURRENT_TAG). Nothing to do."
+  rm -f "$FLAG_FILE"
   exit 0
 fi
 
@@ -108,6 +121,14 @@ MATCH="$(echo "$ALLOWLIST" \
 
 log "Signature verified. Signer: $FP"
 
+# --- notify or apply ---
+if [[ "$AUTO_APPLY" != "true" ]]; then
+  echo "$LATEST_TAG" > "$FLAG_FILE"
+  log "Update available: $LATEST_TAG (signature verified). Not applying — AUTO_APPLY is not enabled."
+  log "To apply manually: cd $INSTALL_DIR && git checkout -f $LATEST_TAG && docker compose up -d --build --force-recreate"
+  exit 0
+fi
+
 # --- apply update ---
 COMMIT_SHA="$(git rev-list -n 1 "$LATEST_TAG")"
 log "Checking out $LATEST_TAG ($COMMIT_SHA)"
@@ -126,4 +147,5 @@ else
   log "WARNING: Health check failed after update. Container may still be starting."
 fi
 
+rm -f "$FLAG_FILE"
 log "Update complete: $CURRENT_TAG -> $LATEST_TAG"
