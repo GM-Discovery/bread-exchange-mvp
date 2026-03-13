@@ -22,7 +22,13 @@
 <body>
   <div class="screen">
     <div class="wrap" id="app">
-
+      <!-- Update available banner -->
+      <div id="updateBanner" style="display:none; padding:12px 14px; margin-bottom:10px; border-radius:var(--r-xl); border:1px solid rgba(205,185,176,.45); background:rgba(205,185,176,.10); font-size:13px; line-height:1.4;">
+        <strong>Update available:</strong> <span id="updateBannerTag"></span>
+        <div class="muted2" style="font-size:12px; margin-top:6px;">
+          Your operator can apply this update. If auto-apply is enabled, it will install at the next scheduled check.
+        </div>
+      </div>
       <!-- Top header + global nav (always visible) -->
       <div class="topbar" style="align-items:flex-start;">
         <div style="flex:1;">

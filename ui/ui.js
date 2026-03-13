@@ -2013,6 +2013,7 @@ function setAliasLabel(public_alias, labelOrNull) {
 
     if (window.__initLegacyUI_ran) return;
     window.__initLegacyUI_ran = true;
+    
     // Poll status banner buttons (poll view)
     const clearHintBtn = document.getElementById("clearVoteHintBtn");
     if (clearHintBtn) {
@@ -2116,6 +2117,22 @@ function setAliasLabel(public_alias, labelOrNull) {
         if (settingsModal) settingsModal.style.display = "none";
       };
     }
+
+    // =========================
+    // Update-available banner
+    // =========================
+    (async () => {
+      try {
+        const r = await fetch(`${EXCHANGE_API}/update-available`, { cache: "no-store" });
+        if (!r.ok) return;
+        const data = await r.json();
+        if (!data?.available) return;
+        const banner = document.getElementById("updateBanner");
+        const tagEl = document.getElementById("updateBannerTag");
+        if (banner) banner.style.display = "block";
+        if (tagEl) tagEl.textContent = String(data.tag);
+      } catch {}
+    })();
 
     // =========================
     // Settings: Identity wiring (device-local)

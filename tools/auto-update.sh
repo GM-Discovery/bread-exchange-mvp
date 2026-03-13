@@ -37,6 +37,13 @@ command -v gpg    >/dev/null 2>&1 || fail "gpg not found"
 command -v git    >/dev/null 2>&1 || fail "git not found"
 command -v docker >/dev/null 2>&1 || fail "docker not found"
 
+# --- self-install cron if missing ---
+CRON_CMD="0 3 * * * ${INSTALL_DIR}/tools/auto-update.sh >> /var/log/bread-update.log 2>&1"
+if ! (crontab -l 2>/dev/null | grep -qF "auto-update.sh"); then
+  ( crontab -l 2>/dev/null; echo "$CRON_CMD" ) | crontab -
+  log "Cron entry self-installed."
+fi
+
 DOCKER_COMPOSE=""
 if docker compose version >/dev/null 2>&1; then
   DOCKER_COMPOSE="docker compose"

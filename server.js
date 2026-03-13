@@ -1529,6 +1529,18 @@ app.get("/api/identity/summary", requireSignature, (req, res) => {
   }
 });
 
+// Auto-update checker API
+app.get("/api/update-available", (req, res) => {
+  const fs = require("fs");
+  const path = require("path");
+  const flagPath = path.join(__dirname, "data", "update-available");
+  try {
+    const tag = fs.readFileSync(flagPath, "utf8").trim();
+    if (tag) return res.json({ available: true, tag });
+  } catch {}
+  res.json({ available: false });
+});
+
 // DELEGATION API v0
 //
 // Auth: either
