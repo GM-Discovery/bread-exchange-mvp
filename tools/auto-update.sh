@@ -16,7 +16,7 @@ set -euo pipefail
 
 INSTALL_DIR="${BREAD_INSTALL_DIR:-/opt/bread-exchange-mvp}"
 ENV_FILE="${INSTALL_DIR}/.env"
-FLAG_FILE="/var/log/bread-update-available"
+FLAG_FILE="${INSTALL_DIR}/data/update-available"
 LOG_PREFIX="[bread-update $(date -u '+%Y-%m-%dT%H:%M:%SZ')]"
 
 log()  { echo "$LOG_PREFIX $*"; }
