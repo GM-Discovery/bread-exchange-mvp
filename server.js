@@ -977,40 +977,6 @@ function writeDelegations(d) {
   writeJson(DELEGATION_DB_PATH, d);
 }
 
-// Sum ACTIVE outbound delegations for a delegator
-function sumActiveDelegationsOut(delegatorInternalId) {
-  const d = readDelegations();
-  const rows = Array.isArray(d.delegations) ? d.delegations : [];
-  let sum = 0;
-
-  for (const r of rows) {
-    if (!r) continue;
-    if (r.status !== "ACTIVE") continue;
-    if (r.delegator_internal_id !== delegatorInternalId) continue;
-    const amt = Number(r.amount);
-    if (!Number.isFinite(amt) || amt <= 0) continue;
-    sum += amt;
-  }
-  return sum;
-}
-
-// Sum ACTIVE inbound delegations for a delegatee
-function sumActiveDelegationsIn(delegateeInternalId) {
-  const d = readDelegations();
-  const rows = Array.isArray(d.delegations) ? d.delegations : [];
-  let sum = 0;
-
-  for (const r of rows) {
-    if (!r) continue;
-    if (r.status !== "ACTIVE") continue;
-    if (r.delegatee_internal_id !== delegateeInternalId) continue;
-    const amt = Number(r.amount);
-    if (!Number.isFinite(amt) || amt <= 0) continue;
-    sum += amt;
-  }
-  return sum;
-}
-
 // POST /api/delegation/revoke
 // Body:
 //   - self_id (delegator) OR (operator) delegator_alias
@@ -1548,13 +1514,6 @@ app.get("/api/update-available", (req, res) => {
 // - self_id in body (delegator proves stable identity)
 //
 // Body uses self_id + delegatee_alias per kernel.
-
-function isOperator(req) {
-  const operatorKey = process.env.OPERATOR_KEY;
-  if (!operatorKey) return false;
-  const presented = req.get("X-Operator-Key");
-  return presented === operatorKey;
-}
 
 function requireSelfOrOperator(req, res) {
   if (isOperator(req)) return { ok: true, by: "operator" };

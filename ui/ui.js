@@ -82,7 +82,7 @@ function setAdminEnabled(enabled) {
   const LS_LOCAL_VOTES = "breadpoll_local_votes_v1"; // poll_id -> { byToken: {token: choice}, counts: {option: n} }
   const LS_REMOTE_LAST_CHOICE = "breadpoll_remote_last_choice_v1"; // poll_id -> last chosen label (UI hint only)
   const LS_VOTE_SESSION = "breadpoll_vote_session_v0"; // poll_id -> { last_known_has_vote, stranded_reason, last_error_code }
-
+  const LS_SETTINGS_SEEN = "helm_settings_seen";
   // =========================
   // API base selection (optional)
   // =========================
@@ -2107,7 +2107,6 @@ function setAliasLabel(public_alias, labelOrNull) {
     // =========================
     // Settings first-visit popup
     // =========================
-    const LS_SETTINGS_SEEN = "helm_settings_seen";
     const settingsModal = document.getElementById("settingsModal");
     const settingsDismiss = document.getElementById("settingsDismiss");
 
@@ -2652,11 +2651,6 @@ async function netAddPartner() {
   await netRefreshStatus();
 }
 
-function renderNetworkPartnersState(message) {
-  const el = document.getElementById("netPartnersState");
-  if (el) el.textContent = String(message || "");
-}
-
 async function refreshNetworkUi() {
   renderNetworkPartnersState("Loading network…");
   await Promise.allSettled([
@@ -2822,7 +2816,7 @@ if (clearStampsBtn) {
         return;
       }
       setUiBusy(true, "Purging stamps…");
-      setExchangeStampPool([]);
+      clearExchangeStampPool();
       refreshStampUi();
       if (stampStatus) stampStatus.textContent = "Stamps purged.";
     } catch (e) {
