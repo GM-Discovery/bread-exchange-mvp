@@ -1311,6 +1311,7 @@ function setAliasLabel(public_alias, labelOrNull) {
     const pollView = document.getElementById("pollView");
     const pollTitle = document.getElementById("pollTitle");
     const pollMeta = document.getElementById("pollMeta");
+    const pollDescription = document.getElementById("pollDescription");
     const voteOut = document.getElementById("voteOut");
     const resultsBox = document.getElementById("resultsBox");
     const vb = document.getElementById("voteButtons");
@@ -1345,6 +1346,38 @@ function setAliasLabel(public_alias, labelOrNull) {
     const pollTypeText = full?.poll_type ?? full?.meta?.poll_type ?? "";
     if (pollTitle) pollTitle.textContent = (full && full.title) ? full.title : "(untitled)";
     if (pollMeta) pollMeta.textContent = `${pollTypeText}${isLocalNow ? " • Local" : " • Remote"}`;
+
+    // Render sanitized description/details.
+    // Remote polls use "description" from the Exchange.
+    // Local drafts currently use "question_html".
+    if (pollDescription) {
+      const detailsHtml = String(
+        full?.description ||
+        full?.question_html ||
+        full?.meta?.question_html ||
+        ""
+      ).trim();
+
+      if (detailsHtml) {
+        pollDescription.innerHTML = detailsHtml;
+        pollDescription.style.display = "block";
+      } else {
+        pollDescription.innerHTML = "";
+        pollDescription.style.display = "none";
+      }
+    }
+
+    const pollDescription = document.getElementById("pollDescription");
+    if (pollDescription) {
+      const html = String(full?.description || "").trim();
+      if (html) {
+        pollDescription.innerHTML = html;
+        pollDescription.style.display = "";
+      } else {
+        pollDescription.innerHTML = "";
+        pollDescription.style.display = "none";
+      }
+    }
 
     // Assertion-to-exchange UI (local drafts only)
     if (assertBtn) {
@@ -3173,12 +3206,14 @@ if (delegationRefreshBtn) {
             title,
             poll_type,
             options,
+            description: question_html,
             question_html,
             created_at: Date.now(),
             is_local: true,
             status: "OPEN",
             meta: {
               anonymous_allowed,
+              question_html,
             },
           };
 
