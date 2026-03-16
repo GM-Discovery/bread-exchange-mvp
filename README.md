@@ -11,6 +11,8 @@ Install instructions way below, at the bottom, last thing if you're skipping to 
  → [Jump to Install](#install)
 
 <img width="438" height="432" alt="image" src="https://github.com/user-attachments/assets/02c99c8f-aec7-471b-9a39-c059d1119ee1" />
+https://exchange.breadstandard.com (Live Example Version of the App)
+
 
 I'm Grant, btw. The creator of this "app."
 
@@ -148,7 +150,7 @@ You need three things -
 3. This app. Install instructions below.
 
 #### Owning a server (or renting a VPS)
-If you already own a server you can skip to Install below:
+If you already own a server you can skip to owning a domain below:
 
 Servers are basically anything that connects to the internet and can host your apps.
 
@@ -158,15 +160,17 @@ So make sure your system can run that and Docker (should be auto-installed) + th
 
 That said, the public record of polls and identities and stamps and such can get very long, I recommend pruning regularly or setting the configuration to auto-sheer.
 
-But you don't need a strong server, I rented the cheapest one on Hetzner to build the thing when I started, less than $4 monthly, which is like half the cost of my regular loaf of bread.
+But you don't need a strong server, I rented the cheapest one on Hetzner to build the thing when I started.
 
 And the internet, you need to connect your server to the net.
 
 More details can be found in operator_notes.md in the top level folder (root) and after install a .env will be generated with your keys and identity.
 
+#### Domain Instructions
+
 After you have your server, you just need to point A and AAAA records at the server. 
 
-This means opening DNS and adding a new record your subdomain name (I recommend exchange). 
+This means opening DNS and adding a new record for your subdomain name (I recommend "exchange"). (e.g. exchange.yourdomain.com) 
 
 Then the IPv4 and/or IPv6 addresses from your server into the DNS records and saving it.
 
@@ -174,7 +178,7 @@ It could take a short while for your DNS records to work.
 
 ---
 
-### Parnterships and joining the network! 
+### Partnerships and joining the network! 
 
 Your identity and public key are in the generated .env.exchange file that will be generated for you automatically when you first install the file. Save that file someplace safe.
 
@@ -216,11 +220,11 @@ Core functionality exists:
 
 ##### Planned development includes:
 
-• stronger trust-weight frameworks  
+• stronger trust-weight frameworks via tags 
 
-• federation discovery  
+• federation discovery and ingestation
 
-• governance rule modules
+• governance rule modules via tagging
 
 ### Roadmap
 
@@ -232,7 +236,7 @@ Core functionality exists:
 #### Medium term
 - discovery between exchanges
 - governance rule modules
-- improved delegation tools
+- improved delegation tools (auto-populate a share card)
 
 #### Long term
 - large-scale federation networks
@@ -253,7 +257,7 @@ Results can be independently verified by reviewing the recorded data.
 
 Operators should secure their servers and keys appropriately.
 ---
-## Install instructions
+## Install
 
 You need to enter the terminal to your server and enter two commands.
 
@@ -263,12 +267,14 @@ You need to enter the terminal to your server and enter two commands.
 curl -fsSL -o install.sh https://raw.githubusercontent.com/GM-Discovery/bread-exchange-mvp/v0.2.1/install.sh
 ```
 
-#### Then, when you're ready to install, you can change the name of the command below to install, be sure to replace YOUR.DOMAIN.HERE in the command to your actual domain.
+#### Then, when you're ready to install, you can change the name of the command below to install, be sure to replace YOUR.DOMAIN.HERE in the command to your actual domain. No "https" required. (e.g. exchange.breadstandard.com)
 
 ```
 sudo bash install.sh --domain YOUR.DOMAIN.HERE --tag v0.2.1
 ```
 
-After that, a "cron" will attempt to let you know of any updates automatically daily at 3am PST.
+After that, a "cron" will attempt to let you know of any updates automatically daily at 3am local. 
+
+You can enable auto-updates by changing the option in the .env file to true.
 
 Thank you.

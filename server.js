@@ -17,6 +17,7 @@ const cors = require("cors");
 const { nanoid } = require("nanoid");
 const fs = require("fs");
 const path = require("path");
+const sanitizeHtml = require("sanitize-html");
 
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
 
@@ -117,6 +118,24 @@ function mergeConfig(base, override) {
     }
   }
   return out;
+}
+
+function sanitizePollDescription(html) {
+  return sanitizeHtml(String(html || ""), {
+    allowedTags: [
+      "p","br","strong","em","u","ul","ol","li","a"
+    ],
+    allowedAttributes: {
+      a: ["href","target","rel"]
+    },
+    allowedSchemes: ["http","https","mailto"],
+    transformTags: {
+      a: sanitizeHtml.simpleTransform("a", {
+        rel: "noopener noreferrer nofollow",
+        target: "_blank"
+      })
+    }
+  });
 }
 
 // ============================================================================
@@ -2012,7 +2031,7 @@ app.post("/api/polls", (req, res) => {
   const poll = {
     id,
     title: String(title).slice(0, 200),
-    description: description ? String(description).slice(0, 5000) : "",
+    description: sanitizePollDescription(description).slice(0, 5000),
     type: type ? String(type) : "single",
     poll_class: req.body?.poll_class ? String(req.body.poll_class) : null,
     options: options.map((o, idx) => ({
