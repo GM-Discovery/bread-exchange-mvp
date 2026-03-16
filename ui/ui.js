@@ -1367,18 +1367,6 @@ function setAliasLabel(public_alias, labelOrNull) {
       }
     }
 
-    const pollDescription = document.getElementById("pollDescription");
-    if (pollDescription) {
-      const html = String(full?.description || "").trim();
-      if (html) {
-        pollDescription.innerHTML = html;
-        pollDescription.style.display = "";
-      } else {
-        pollDescription.innerHTML = "";
-        pollDescription.style.display = "none";
-      }
-    }
-
     // Assertion-to-exchange UI (local drafts only)
     if (assertBtn) {
       assertBtn.style.display = isLocalNow ? "" : "none";
