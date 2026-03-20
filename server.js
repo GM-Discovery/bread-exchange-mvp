@@ -1514,6 +1514,48 @@ app.get("/api/identity/summary", requireSignature, (req, res) => {
   }
 });
 
+// --- Identity Events (Trust Ledger Viewer) ---
+// Returns only events for the current identity
+
+app.get("/api/identity/events", (req, res) => {
+  try {
+    const limit = Math.max(1, Math.min(200, Number(req.query.limit) || 50));
+
+    // Load identity ledger
+    const ledger = readIdentityLedger();
+
+    // Resolve current identity
+    const internalId = req.get("X-Identity-Internal-Id");
+    if (!internalId) {
+      return res.status(400).json({ ok: false, error: "missing_identity" });
+    }
+
+    // Filter events belonging to this identity
+    const events = (ledger.events || [])
+      .filter(e => String(e.internal_id) === String(internalId))
+      .sort((a, b) => String(b.ts).localeCompare(String(a.ts)))
+      .slice(0, limit)
+      .map(e => ({
+        ts: e.ts,
+        type: e.type,
+        delta_weight: e.delta_weight || 0,
+        by: e.meta && e.meta.by ? e.meta.by : null,
+        reason: e.meta && e.meta.reason ? e.meta.reason : null,
+        applied_delta: e.meta && e.meta.applied_delta,
+        ip: e.meta && e.meta.ip
+      }));
+
+    return res.json({
+      ok: true,
+      events
+    });
+
+  } catch (err) {
+    console.error("identity_events_failed:", err);
+    return res.status(500).json({ ok: false, error: "identity_events_failed" });
+  }
+});
+
 // Auto-update checker API
 app.get("/api/update-available", (req, res) => {
   const fs = require("fs");

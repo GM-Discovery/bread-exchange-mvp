@@ -3081,6 +3081,61 @@ if (delegationRefreshBtn) {
   try { return JSON.parse(raw); } catch { return { ok: true }; }
 }
 
+async function loadTrustEvents() {
+  const status = document.getElementById("trustEventsStatus");
+  const list = document.getElementById("trustEventsList");
+
+  if (!status || !list) return;
+
+  status.textContent = "Loading...";
+  list.innerHTML = "";
+
+  try {
+    const res = await fetch(API + "/identity/events?limit=50", {
+      headers: {
+        "X-Identity-Internal-Id": localStorage.getItem("identity_internal_id") || ""
+      }
+    });
+
+    const data = await res.json();
+
+    if (!data.ok) throw new Error(data.error || "failed");
+
+    if (!data.events.length) {
+      status.textContent = "No events yet.";
+      return;
+    }
+
+    status.textContent = "";
+
+    for (const e of data.events) {
+      const row = document.createElement("div");
+      row.className = "card";
+
+      row.innerHTML = `
+        <div><strong>${e.type}</strong></div>
+        <div>${e.ts}</div>
+        <div>Δ Weight: ${e.delta_weight}</div>
+        <div>Reason: ${e.reason || "-"}</div>
+        <div>By: ${e.by || "-"}</div>
+      `;
+
+      list.appendChild(row);
+    }
+
+  } catch (err) {
+    status.textContent = "Failed to load events";
+  }
+}
+
+// Hook button
+document.addEventListener("DOMContentLoaded", () => {
+  const btn = document.getElementById("trustEventsRefreshBtn");
+  if (btn) {
+    btn.onclick = loadTrustEvents;
+  }
+});
+
     if (delegationSetBtn) {
       delegationSetBtn.onclick = async () => {
         try {
