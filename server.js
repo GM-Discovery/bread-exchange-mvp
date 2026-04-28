@@ -1517,18 +1517,20 @@ app.get("/api/identity/summary", requireSignature, (req, res) => {
 // --- Identity Events (Trust Ledger Viewer) ---
 // Returns only events for the current identity
 
-app.get("/api/identity/events", (req, res) => {
+app.get("/api/identity/events", requireSignature, (req, res) => {
   try {
     const limit = Math.max(1, Math.min(200, Number(req.query.limit) || 50));
 
     // Load identity ledger
     const ledger = readIdentityLedger();
 
-    // Resolve current identity
-    const internalId = req.get("X-Identity-Internal-Id");
-    if (!internalId) {
-      return res.status(400).json({ ok: false, error: "missing_identity" });
-    }
+    // Resolve current identity from signed auth context.
+    const selfHash = req?.auth?.self_id_hash;
+    if (!selfHash) return res.status(401).json({ ok: false, error: "missing_identity" });
+    const state = readIdentityState();
+    const identity = findIdentityBySelfIdHash(state, String(selfHash));
+    if (!identity) return res.status(404).json({ ok: false, error: "identity_not_found" });
+    const internalId = String(identity.internal_id || "");
 
     // Filter events belonging to this identity
     const events = (ledger.events || [])
@@ -2149,6 +2151,14 @@ app.post("/api/polls/:id/vote", (req, res) => {
   // Poll must exist (both first-vote and revote paths need it)
   const poll = db.polls.find(p => p.id === pollId);
   if (!poll) return res.status(404).json({ error: "poll not found" });
+
+  // Validate option before any token/stamp spend.
+  const options = Array.isArray(poll.options) ? poll.options : [];
+  const optionExists = options.some((o, idx) => {
+    if (o && typeof o === "object" && o.id != null) return String(o.id) === String(option_id);
+    return String(idx + 1) === String(option_id);
+  });
+  if (!optionExists) return res.status(400).json({ error: "bad_option_id" });
 
   // Apply lifecycle on access
   const life = applyLifecycle(poll, nowIso());

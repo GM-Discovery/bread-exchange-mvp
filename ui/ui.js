@@ -3091,11 +3091,7 @@ async function loadTrustEvents() {
   list.innerHTML = "";
 
   try {
-    const res = await fetch(API + "/identity/events?limit=50", {
-      headers: {
-        "X-Identity-Internal-Id": localStorage.getItem("identity_internal_id") || ""
-      }
-    });
+    const res = await exchangeFetchAuthed("/identity/events?limit=50", { method: "GET" });
 
     const data = await res.json();
 
