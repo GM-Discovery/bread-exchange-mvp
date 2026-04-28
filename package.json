@@ -4,7 +4,11 @@
   "private": true,
   "type": "commonjs",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "check": "node tools/check_syntax.js",
+    "test:discovery": "node tools/test_discovery_kernel.js",
+    "smoke:api": "node tools/smoke_api.js",
+    "verify": "npm run check && npm run test:discovery"
   },
   "dependencies": {
     "cors": "^2.8.5",

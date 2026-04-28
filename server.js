@@ -359,6 +359,7 @@ const cfg = loadConfig();
 // Load lifecycle as an object so we can call lifecycle.setDefaults(...)
 const lifecycle = require("./lib/lifecycle");
 const federation = require("./lib/federation");
+const discovery = require("./lib/discovery");
 const { applyLifecycle, canVote, isVisibleInList, nowIso } = lifecycle;
 
 // --- Canonical JSON + hashing (for commitments) ---
@@ -764,7 +765,7 @@ function migrateLegacyDbIfNeeded() {
 function loadDB() {
   migrateLegacyDbIfNeeded();
 
-  const exchange = readJsonOrInit(EXCHANGE_DB_PATH, { polls: [], votes: [], events: [], overrides: [] });
+  const exchange = readJsonOrInit(EXCHANGE_DB_PATH, { polls: [], votes: [], events: [], overrides: [], discovery_queue: {} });
   const identity = readJsonOrInit(IDENTITY_DB_PATH, { personas: [], stamps: [], keys: [], challenges: [] });
 
   // Backfill new arrays if someone hand-edited files
@@ -772,6 +773,7 @@ function loadDB() {
   if (!Array.isArray(exchange.votes)) exchange.votes = [];
   if (!Array.isArray(exchange.events)) exchange.events = [];
   if (!Array.isArray(exchange.overrides)) exchange.overrides = [];
+  if (!exchange.discovery_queue || typeof exchange.discovery_queue !== "object") exchange.discovery_queue = {};
 
   if (!Array.isArray(identity.personas)) identity.personas = [];
   if (!Array.isArray(identity.stamps)) identity.stamps = [];
@@ -784,6 +786,7 @@ function loadDB() {
     votes: exchange.votes,
     events: exchange.events,
     overrides: exchange.overrides,
+    discovery_queue: exchange.discovery_queue,
 
     personas: identity.personas,
     stamps: identity.stamps,
@@ -800,6 +803,7 @@ function saveDB(db) {
     votes: Array.isArray(db.votes) ? db.votes : [],
     events: Array.isArray(db.events) ? db.events : [],
     overrides: Array.isArray(db.overrides) ? db.overrides : [],
+    discovery_queue: (db.discovery_queue && typeof db.discovery_queue === "object") ? db.discovery_queue : {},
   });
 
   // Identity / authority state
@@ -1274,6 +1278,17 @@ app.get("/api/config", (req, res) => {
     fingerprint: CFG_FINGERPRINT,
     config: CFG_PUBLIC,
   });
+});
+
+// Discovery queue operator snapshot (read-only).
+mountOperatorRoute("get", "/api/discovery/status", (req, res) => {
+  try {
+    const db = loadDB();
+    return res.json(getDiscoveryStatusSnapshot(db));
+  } catch (e) {
+    console.error("/api/discovery/status failed:", e);
+    return res.status(500).json({ ok: false, error: "discovery_status_failed" });
+  }
 });
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -1938,6 +1953,17 @@ app.get("/api/polls", (req, res) => {
     if (life.changed) changedAny = true;
   }
 
+  // Discovery kernel tick:
+  // - expire hidden polls from queue
+  // - place visible polls into bracketed slots
+  // - grant daily slot credit on real interaction
+  try {
+    const disc = runDiscoveryTick(db, t);
+    if (disc.changed) changedAny = true;
+  } catch (e) {
+    console.error("[discovery] tick failed:", e);
+  }
+
   if (changedAny) saveDB(db);
 
   // Build response using authoritative results
@@ -2519,6 +2545,153 @@ function computeResults(db, pollId) {
     weights_used: { min: wMin, max: wMax, sum: wSum, count: wCount },
 
     validated: true,
+  };
+}
+
+function runDiscoveryTick(db, nowIsoValue) {
+  if (!db || !Array.isArray(db.polls)) return { changed: false };
+  if (!db.discovery_queue || typeof db.discovery_queue !== "object") db.discovery_queue = {};
+
+  const before = stableStringify({
+    queue: db.discovery_queue,
+    polls: db.polls.map(p => ({
+      id: String(p?.id || ""),
+      discovery: p?.discovery || null,
+    })),
+  });
+
+  const pollIndex = {};
+  const resultsByPollId = {};
+  for (const p of db.polls) {
+    if (!p || !p.id) continue;
+    pollIndex[String(p.id)] = p;
+    resultsByPollId[String(p.id)] = getAuthoritativeResults(db, p);
+  }
+
+  discovery.expireDiscoveryPolls(db.discovery_queue, nowIsoValue, { pollIndex });
+
+  for (const p of db.polls) {
+    if (!p) continue;
+    if (!isVisibleInList(p, nowIsoValue)) continue;
+    discovery.placePollInDiscoverySlots(p, db.discovery_queue, {
+      now: nowIsoValue,
+      local_exchange_id: process.env.EXCHANGE_ID || "",
+      pollIndex,
+      existing_polls: db.polls,
+      results: resultsByPollId[String(p.id)] || null,
+      resultsByPollId,
+    });
+  }
+
+  discovery.grantDailySlotCredit(db.discovery_queue, nowIsoValue, {
+    pollIndex,
+    resultsByPollId,
+  });
+
+  const after = stableStringify({
+    queue: db.discovery_queue,
+    polls: db.polls.map(p => ({
+      id: String(p?.id || ""),
+      discovery: p?.discovery || null,
+    })),
+  });
+
+  return { changed: before !== after };
+}
+
+function getDiscoveryStatusSnapshot(db) {
+  const queue = (db && db.discovery_queue && typeof db.discovery_queue === "object")
+    ? db.discovery_queue
+    : {};
+  const bySlot = (queue.bySlot && typeof queue.bySlot === "object") ? queue.bySlot : {};
+  const byPollId = (queue.byPollId && typeof queue.byPollId === "object") ? queue.byPollId : {};
+
+  const bracketSpecs = [
+    { name: "featured", range: [0, 9] },
+    { name: "local_always", range: [10, 19] },
+    { name: "worldwide_civic", range: [20, 24] },
+    { name: "region_of_nations", range: [25, 29] },
+    { name: "topical", range: [30, 99] },
+    { name: "broad_rotation", range: [100, 199] },
+    { name: "local_deep", range: [200, 299] },
+    { name: "long_queue", range: [300, 1000] },
+  ];
+
+  const pollById = {};
+  for (const p of (db.polls || [])) {
+    if (!p || !p.id) continue;
+    pollById[String(p.id)] = p;
+  }
+
+  function summarizeSlot(slotNum) {
+    const pollId = bySlot[String(slotNum)] || bySlot[slotNum];
+    if (!pollId) return null;
+    const p = pollById[String(pollId)] || null;
+    return {
+      slot: Number(slotNum),
+      poll_id: String(pollId),
+      title: p ? String(p.title || "") : "",
+      bracket: p?.discovery?.bracket ? String(p.discovery.bracket) : null,
+      score: Number(p?.discovery?.score || 0),
+      discovery_standing: Number(p?.discovery?.discovery_standing || 0),
+      status: p ? String(p.status || "") : "",
+      visible: p ? !!isVisibleInList(p, nowIso()) : false,
+    };
+  }
+
+  const brackets = bracketSpecs.map((b) => {
+    let occupied = 0;
+    const [start, end] = b.range;
+    for (let s = start; s <= end; s += 1) {
+      if (bySlot[String(s)] || bySlot[s]) occupied += 1;
+    }
+    return {
+      bracket: b.name,
+      range: b.range,
+      capacity: end - start + 1,
+      occupied,
+      occupancy_rate: Number(((occupied / (end - start + 1)) * 100).toFixed(2)),
+    };
+  });
+
+  const topSlots = [];
+  const sortedSlots = Object.keys(bySlot)
+    .map((x) => Number(x))
+    .filter((n) => Number.isFinite(n))
+    .sort((a, b) => a - b)
+    .slice(0, 40);
+  for (const s of sortedSlots) {
+    const row = summarizeSlot(s);
+    if (row) topSlots.push(row);
+  }
+
+  const scoreRows = Object.keys(byPollId)
+    .map((pid) => {
+      const slot = Number(byPollId[pid]);
+      const p = pollById[String(pid)] || null;
+      return {
+        poll_id: String(pid),
+        slot: Number.isFinite(slot) ? slot : null,
+        title: p ? String(p.title || "") : "",
+        bracket: p?.discovery?.bracket ? String(p.discovery.bracket) : null,
+        score: Number(p?.discovery?.score || 0),
+        standing: Number(p?.discovery?.discovery_standing || 0),
+        visible: p ? !!isVisibleInList(p, nowIso()) : false,
+      };
+    })
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 50);
+
+  return {
+    ok: true,
+    ts: nowIso(),
+    queue: {
+      slots_total_populated: Object.keys(bySlot).length,
+      polls_tracked: Object.keys(byPollId).length,
+    },
+    brackets,
+    top_slots: topSlots,
+    top_scores: scoreRows,
   };
 }
 
