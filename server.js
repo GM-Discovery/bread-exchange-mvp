@@ -10,6 +10,33 @@
  * - Persistence: JSON file on disk (data/db.json)
  * - Notes:
  *   
+ *  *   Value Function (Conceptual)
+ * 
+ * After defining the system invariants above, the effective value and integrity of a person in the system can be expressed as:
+ * 
+ * V(person) ≈ (A × R × C) / P
+ * 
+ * Where:
+ * 
+ * A = Agency (ability to act and be accountable)
+ * R = Relational continuity (history + context across time)
+ * C = Capacity for correction (ability to responsibly override)
+ * P = Replaceability (approaches zero for true identity)
+ * 
+ * As P → 0 (non-fungible identity), system value and integrity → ∞.
+ * 
+ * Summary
+ * 
+ * A person is not just a user account.
+ * 
+ * A person is:
+ * 
+ * a source of actions (A)
+ * a carrier of history and relationships (R)
+ * a capable corrector of their own record (C)
+ * and non-replaceable within system meaning (P → 0)
+ * 
+ * Systems that treat persons as interchangeable will lose audit integrity, accountability, and trust.
  */
 
 const express = require("express");
