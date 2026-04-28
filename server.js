@@ -20,6 +20,8 @@ const path = require("path");
 const sanitizeHtml = require("sanitize-html");
 
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
+const OPERATOR_ENV_OVERRIDES_PATH = path.join(DATA_DIR, "operator.env.overrides.json");
+const DISCOVERY_CONFIG_PATH = path.join(DATA_DIR, "discovery.config.json");
 
 // Header name is locked by your decision:
 const STAMP_HEADER = "X-Stamp";
@@ -28,6 +30,55 @@ const VOTER_TOKEN_HEADER = "X-Voter-Token";
 const SELF_ID_HEADER = "X-Self-ID";
 
 const crypto = require("crypto");
+const restartStatus = {
+  required: false,
+  reasons: [],
+  updated_at: null,
+};
+
+function markRestartRequired(reason) {
+  const r = String(reason || "").trim();
+  if (!r) return;
+  restartStatus.required = true;
+  if (!restartStatus.reasons.includes(r)) restartStatus.reasons.push(r);
+  restartStatus.updated_at = nowIso();
+}
+
+function getRestartStatus() {
+  return {
+    required: !!restartStatus.required,
+    reasons: restartStatus.reasons.slice(),
+    updated_at: restartStatus.updated_at,
+  };
+}
+
+function ensureDataDir() {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+
+function readJsonFile(filePath, fallback) {
+  try {
+    if (!fs.existsSync(filePath)) return fallback;
+    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch (_) {
+    return fallback;
+  }
+}
+
+function writeJsonFile(filePath, obj) {
+  ensureDataDir();
+  fs.writeFileSync(filePath, JSON.stringify(obj, null, 2), "utf8");
+}
+
+function applyOperatorEnvOverrides() {
+  const raw = readJsonFile(OPERATOR_ENV_OVERRIDES_PATH, { values: {} });
+  const values = raw && typeof raw.values === "object" ? raw.values : {};
+  for (const k of Object.keys(values)) {
+    process.env[k] = String(values[k]);
+  }
+}
+
+applyOperatorEnvOverrides();
 
 // --- Persona-unique ballot UID (one persona -> one vote per poll) ---
 // This computes a stable, non-raw key for a (persona_id, poll_id) pair.
@@ -717,6 +768,126 @@ function writeJson(filePath, obj) {
   fs.writeFileSync(filePath, JSON.stringify(obj, null, 2));
 }
 
+function readDiscoveryConfig() {
+  return readJsonFile(DISCOVERY_CONFIG_PATH, {
+    gatekeeper1_lookahead: 5,
+    gatekeeper1_weak_score: 1.0,
+    brackets: null,
+  });
+}
+
+function sanitizeDiscoveryConfig(input) {
+  const out = {
+    gatekeeper1_lookahead: 5,
+    gatekeeper1_weak_score: 1.0,
+    brackets: null,
+  };
+  if (input && typeof input === "object") {
+    const lk = Number(input.gatekeeper1_lookahead);
+    if (Number.isFinite(lk) && lk >= 1 && lk <= 10) out.gatekeeper1_lookahead = Math.floor(lk);
+
+    const ws = Number(input.gatekeeper1_weak_score);
+    if (Number.isFinite(ws) && ws >= -100 && ws <= 100) out.gatekeeper1_weak_score = ws;
+
+    if (Array.isArray(input.brackets)) {
+      const brackets = [];
+      for (const b of input.brackets) {
+        if (!b || typeof b !== "object") continue;
+        const name = String(b.name || "").trim();
+        const range = Array.isArray(b.range) ? b.range : [];
+        const weight = Number(b.weight);
+        if (!name || range.length !== 2) continue;
+        const start = Number(range[0]);
+        const end = Number(range[1]);
+        if (!Number.isFinite(start) || !Number.isFinite(end)) continue;
+        if (start < 0 || end < start || end > 5000) continue;
+        if (!Number.isFinite(weight)) continue;
+        brackets.push({
+          name,
+          range: [Math.floor(start), Math.floor(end)],
+          weight,
+        });
+      }
+      out.brackets = brackets.length > 0 ? brackets : null;
+    }
+  }
+  return out;
+}
+
+const EDITABLE_ENV_KEYS = [
+  "FED_AUTO_PUSH_ENABLED",
+  "FED_AUTO_PUSH_INTERVAL_MS",
+  "FED_AUTO_PUSH_JITTER_MS",
+  "POW_DIFFICULTY",
+  "POW_TTL_MS",
+  "IDENTITY_CREATE_RL_LIMIT",
+  "IDENTITY_CREATE_RL_WINDOW",
+  "IDENTITY_CHALLENGE_RL_LIMIT",
+  "IDENTITY_CHALLENGE_RL_WINDOW",
+];
+
+function readEditableEnvConfig() {
+  const persisted = readJsonFile(OPERATOR_ENV_OVERRIDES_PATH, { values: {} });
+  const values = {};
+  for (const k of EDITABLE_ENV_KEYS) {
+    const v = process.env[k];
+    values[k] = v == null ? "" : String(v);
+  }
+  return {
+    editable_keys: EDITABLE_ENV_KEYS.slice(),
+    values,
+    persisted_values: (persisted && persisted.values && typeof persisted.values === "object") ? persisted.values : {},
+  };
+}
+
+function writeEditableEnvConfig(nextValues) {
+  const clean = {};
+  for (const k of EDITABLE_ENV_KEYS) {
+    if (!(k in nextValues)) continue;
+    const v = nextValues[k];
+    if (v === null || v === undefined || String(v).trim() === "") continue;
+    clean[k] = String(v).trim();
+  }
+
+  for (const k of EDITABLE_ENV_KEYS) {
+    if (k in clean) process.env[k] = clean[k];
+  }
+  writeJsonFile(OPERATOR_ENV_OVERRIDES_PATH, { values: clean, updated_at: nowIso() });
+  return readEditableEnvConfig();
+}
+
+function sanitizeMainConfigInput(input) {
+  const out = JSON.parse(JSON.stringify(cfg));
+  if (!input || typeof input !== "object") return out;
+
+  const s = input.stamps || {};
+  const l = input.lifecycle || {};
+
+  const poolTarget = Number(s.pool_target);
+  if (Number.isFinite(poolTarget) && poolTarget >= 1 && poolTarget <= 1000) out.stamps.pool_target = Math.floor(poolTarget);
+  const poolMax = Number(s.pool_max);
+  if (Number.isFinite(poolMax) && poolMax >= 1 && poolMax <= 5000) out.stamps.pool_max = Math.floor(poolMax);
+  const rotate = Number(s.rotate_every_uses);
+  if (Number.isFinite(rotate) && rotate >= 1 && rotate <= 1000000) out.stamps.rotate_every_uses = Math.floor(rotate);
+
+  const opRet = Number(l.opinion_retention_seconds);
+  if (Number.isFinite(opRet) && opRet >= 60 && opRet <= 315360000) out.lifecycle.opinion_retention_seconds = Math.floor(opRet);
+  const govRet = Number(l.governance_retention_seconds);
+  if (Number.isFinite(govRet) && govRet >= 60 && govRet <= 315360000) out.lifecycle.governance_retention_seconds = Math.floor(govRet);
+  const govCd = Number(l.governance_cooldown_seconds);
+  if (Number.isFinite(govCd) && govCd >= 1 && govCd <= 315360000) out.lifecycle.governance_cooldown_seconds = Math.floor(govCd);
+
+  if (out.stamps.pool_target > out.stamps.pool_max) out.stamps.pool_target = out.stamps.pool_max;
+  return out;
+}
+
+function renderConfigJs(configObj) {
+  return `"use strict";
+
+module.exports = ${JSON.stringify(configObj, null, 2)};
+`;
+}
+
 // One-time migration:
 // If legacy db.json exists but split files don't, split it.
 // This keeps behavior stable after deploy, without manual steps.
@@ -1288,6 +1459,81 @@ mountOperatorRoute("get", "/api/discovery/status", (req, res) => {
   } catch (e) {
     console.error("/api/discovery/status failed:", e);
     return res.status(500).json({ ok: false, error: "discovery_status_failed" });
+  }
+});
+
+mountOperatorRoute("get", "/api/operator/discovery-config", (req, res) => {
+  try {
+    return res.json({ ok: true, config: readDiscoveryConfig() });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "discovery_config_read_failed" });
+  }
+});
+
+mountOperatorRoute("post", "/api/operator/discovery-config", (req, res) => {
+  try {
+    const next = sanitizeDiscoveryConfig(req.body || {});
+    writeJsonFile(DISCOVERY_CONFIG_PATH, next);
+    return res.json({ ok: true, config: next });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "discovery_config_write_failed" });
+  }
+});
+
+mountOperatorRoute("get", "/api/operator/env-config", (req, res) => {
+  try {
+    return res.json({ ok: true, env: readEditableEnvConfig(), restart: getRestartStatus() });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "env_config_read_failed" });
+  }
+});
+
+mountOperatorRoute("post", "/api/operator/env-config", (req, res) => {
+  try {
+    const body = req.body && typeof req.body === "object" ? req.body : {};
+    const values = body.values && typeof body.values === "object" ? body.values : {};
+    const changedKeys = Object.keys(values);
+    if (changedKeys.some((k) => /^POW_|^IDENTITY_/.test(String(k)))) {
+      markRestartRequired("identity_pow_rate_limit_env_changed");
+    }
+    const next = writeEditableEnvConfig(body.values || {});
+    return res.json({ ok: true, env: next, restart: getRestartStatus() });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "env_config_write_failed" });
+  }
+});
+
+mountOperatorRoute("get", "/api/operator/app-config", (req, res) => {
+  try {
+    return res.json({ ok: true, config: cfg, restart: getRestartStatus() });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "app_config_read_failed" });
+  }
+});
+
+mountOperatorRoute("post", "/api/operator/app-config", (req, res) => {
+  try {
+    const next = sanitizeMainConfigInput(req.body || {});
+    const nextText = renderConfigJs(next);
+    const cfgPath = path.join(__dirname, "config.js");
+    fs.writeFileSync(cfgPath, nextText, "utf8");
+    markRestartRequired("main_config_js_updated");
+    return res.json({
+      ok: true,
+      config: next,
+      note: "config.js updated. Restart server to fully apply startup-bound values.",
+      restart: getRestartStatus(),
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "app_config_write_failed" });
+  }
+});
+
+mountOperatorRoute("get", "/api/operator/restart-status", (req, res) => {
+  try {
+    return res.json({ ok: true, restart: getRestartStatus() });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "restart_status_failed" });
   }
 });
 
@@ -2562,6 +2808,7 @@ function runDiscoveryTick(db, nowIsoValue) {
 
   const pollIndex = {};
   const resultsByPollId = {};
+  const discoveryCfg = readDiscoveryConfig();
   for (const p of db.polls) {
     if (!p || !p.id) continue;
     pollIndex[String(p.id)] = p;
@@ -2580,6 +2827,9 @@ function runDiscoveryTick(db, nowIsoValue) {
       existing_polls: db.polls,
       results: resultsByPollId[String(p.id)] || null,
       resultsByPollId,
+      gatekeeper1_lookahead: discoveryCfg.gatekeeper1_lookahead,
+      gatekeeper1_weak_score: discoveryCfg.gatekeeper1_weak_score,
+      brackets: discoveryCfg.brackets || undefined,
     });
   }
 

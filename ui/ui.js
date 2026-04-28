@@ -56,9 +56,11 @@ function setAdminEnabled(enabled) {
 
   const tabNetwork = document.getElementById("tabNetwork");
   if (tabNetwork) tabNetwork.style.display = __adminEnabled ? "" : "none";
+  const tabDiscovery = document.getElementById("tabDiscovery");
+  if (tabDiscovery) tabDiscovery.style.display = __adminEnabled ? "" : "none";
 
   // If admin is turned off while on Network, kick back to Settings
-  if (!__adminEnabled && currentTab === "network") {
+  if (!__adminEnabled && (currentTab === "network" || currentTab === "discovery")) {
     showTab("settings");
   }
 
@@ -1971,31 +1973,38 @@ function setAliasLabel(public_alias, labelOrNull) {
     // Remember current tab in memory (you already added currentTab)
     currentTab = tabName;
 
-    // Find the 4 page containers from the new HTML
+    // Find page containers from the HTML
     const viewCreate = document.getElementById("viewCreate");
     const viewPolls = document.getElementById("viewPolls");
     const viewSettings = document.getElementById("viewSettings");
     const viewNetwork = document.getElementById("viewNetwork");
+    const viewDiscovery = document.getElementById("viewDiscovery");
 
     // Hide all, then show the requested one
     if (viewCreate) viewCreate.style.display = (tabName === "create") ? "" : "none";
     if (viewPolls) viewPolls.style.display = (tabName === "polls") ? "" : "none";
     if (viewSettings) viewSettings.style.display = (tabName === "settings") ? "" : "none";
     if (viewNetwork) viewNetwork.style.display = (tabName === "network") ? "" : "none";
+    if (viewDiscovery) viewDiscovery.style.display = (tabName === "discovery") ? "" : "none";
 
     // Update tab visual active state (uses your existing .pill.active CSS)
     const tabCreate = document.getElementById("tabCreate");
     const tabPolls = document.getElementById("tabPolls");
     const tabSettings = document.getElementById("tabSettings");
     const tabNetwork = document.getElementById("tabNetwork");
+    const tabDiscovery = document.getElementById("tabDiscovery");
 
     if (tabCreate) tabCreate.classList.toggle("active", tabName === "create");
     if (tabPolls) tabPolls.classList.toggle("active", tabName === "polls");
     if (tabSettings) tabSettings.classList.toggle("active", tabName === "settings");
     if (tabNetwork) tabNetwork.classList.toggle("active", tabName === "network");
+    if (tabDiscovery) tabDiscovery.classList.toggle("active", tabName === "discovery");
 
     if (tabName === "network") {
       window.dispatchEvent(new Event("network:refresh"));
+    }
+    if (tabName === "discovery") {
+      window.dispatchEvent(new Event("discovery:refresh"));
     }
 
     // When entering Settings, refresh trust summary (signed).
@@ -2574,6 +2583,207 @@ async function federationFetch(path, opts) {
   }
   return json;
 }
+
+let __discWired = false;
+function prettyJson(x) {
+  try { return JSON.stringify(x, null, 2); } catch { return "{}"; }
+}
+
+async function discoveryFetch(path, opts) {
+  return federationFetch(path, opts);
+}
+
+async function discRefreshStatus() {
+  const out = document.getElementById("discOut");
+  const pre = document.getElementById("discStatusJson");
+  try {
+    if (out) out.textContent = "Loading discovery status…";
+    const j = await discoveryFetch("/api/discovery/status", { method: "GET", headers: { "Content-Type": "text/plain" } });
+    if (pre) pre.textContent = prettyJson(j);
+    if (out) out.textContent = "Discovery status OK.";
+    return j;
+  } catch (e) {
+    if (pre) pre.textContent = prettyJson({ ok: false, error: String(e?.body?.error || e?.message || e) });
+    if (out) out.textContent = `Discovery status failed: ${String(e?.body?.error || e?.message || e)}`;
+    throw e;
+  }
+}
+
+function renderRestartStatus(payload) {
+  const stateEl = document.getElementById("discRestartState");
+  const reasonsEl = document.getElementById("discRestartReasons");
+  const r = payload && payload.restart ? payload.restart : payload;
+  const required = !!(r && r.required);
+  const reasons = Array.isArray(r?.reasons) ? r.reasons : [];
+  const updatedAt = r?.updated_at ? String(r.updated_at) : "";
+
+  if (stateEl) {
+    stateEl.textContent = required
+      ? `Restart required before all settings fully apply. ${updatedAt ? `(${updatedAt})` : ""}`.trim()
+      : "No restart required.";
+    stateEl.style.color = required ? "#a03e00" : "";
+  }
+  if (reasonsEl) {
+    reasonsEl.textContent = required && reasons.length > 0
+      ? `Reasons: ${reasons.join(", ")}`
+      : "";
+  }
+}
+
+async function discLoadRestartStatus() {
+  const out = document.getElementById("discOut");
+  try {
+    const j = await discoveryFetch("/api/operator/restart-status", { method: "GET", headers: { "Content-Type": "text/plain" } });
+    renderRestartStatus(j?.restart || null);
+    return j;
+  } catch (e) {
+    if (out) out.textContent = `Restart status failed: ${String(e?.body?.error || e?.message || e)}`;
+    throw e;
+  }
+}
+
+async function discLoadDiscoveryConfig() {
+  const status = document.getElementById("discConfigStatus");
+  const box = document.getElementById("discConfigJson");
+  try {
+    if (status) status.textContent = "Loading…";
+    const j = await discoveryFetch("/api/operator/discovery-config", { method: "GET", headers: { "Content-Type": "text/plain" } });
+    if (box) box.value = prettyJson(j?.config || {});
+    if (status) status.textContent = "Loaded.";
+    return j;
+  } catch (e) {
+    if (status) status.textContent = `Load failed: ${String(e?.body?.error || e?.message || e)}`;
+    throw e;
+  }
+}
+
+async function discSaveDiscoveryConfig() {
+  const status = document.getElementById("discConfigStatus");
+  const box = document.getElementById("discConfigJson");
+  try {
+    if (status) status.textContent = "Saving…";
+    const parsed = JSON.parse(String(box?.value || "{}"));
+    const j = await discoveryFetch("/api/operator/discovery-config", {
+      method: "POST",
+      body: JSON.stringify(parsed),
+    });
+    if (box) box.value = prettyJson(j?.config || {});
+    if (status) status.textContent = "Saved.";
+    return j;
+  } catch (e) {
+    if (status) status.textContent = `Save failed: ${String(e?.body?.error || e?.message || e)}`;
+    throw e;
+  }
+}
+
+async function discLoadEnvConfig() {
+  const status = document.getElementById("discEnvStatus");
+  const box = document.getElementById("discEnvJson");
+  try {
+    if (status) status.textContent = "Loading…";
+    const j = await discoveryFetch("/api/operator/env-config", { method: "GET", headers: { "Content-Type": "text/plain" } });
+    if (box) box.value = prettyJson(j?.env || {});
+    renderRestartStatus(j?.restart || null);
+    if (status) status.textContent = "Loaded.";
+    return j;
+  } catch (e) {
+    if (status) status.textContent = `Load failed: ${String(e?.body?.error || e?.message || e)}`;
+    throw e;
+  }
+}
+
+async function discSaveEnvConfig() {
+  const status = document.getElementById("discEnvStatus");
+  const box = document.getElementById("discEnvJson");
+  try {
+    if (status) status.textContent = "Saving…";
+    const parsed = JSON.parse(String(box?.value || "{}"));
+    const body = parsed?.values ? parsed : { values: parsed };
+    const j = await discoveryFetch("/api/operator/env-config", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    if (box) box.value = prettyJson(j?.env || {});
+    renderRestartStatus(j?.restart || null);
+    if (status) status.textContent = "Saved.";
+    return j;
+  } catch (e) {
+    if (status) status.textContent = `Save failed: ${String(e?.body?.error || e?.message || e)}`;
+    throw e;
+  }
+}
+
+async function discLoadAppConfig() {
+  const status = document.getElementById("discAppConfigStatus");
+  const box = document.getElementById("discAppConfigJson");
+  try {
+    if (status) status.textContent = "Loading…";
+    const j = await discoveryFetch("/api/operator/app-config", { method: "GET", headers: { "Content-Type": "text/plain" } });
+    if (box) box.value = prettyJson(j?.config || {});
+    renderRestartStatus(j?.restart || null);
+    if (status) status.textContent = "Loaded.";
+    return j;
+  } catch (e) {
+    if (status) status.textContent = `Load failed: ${String(e?.body?.error || e?.message || e)}`;
+    throw e;
+  }
+}
+
+async function discSaveAppConfig() {
+  const status = document.getElementById("discAppConfigStatus");
+  const box = document.getElementById("discAppConfigJson");
+  try {
+    if (status) status.textContent = "Saving…";
+    const parsed = JSON.parse(String(box?.value || "{}"));
+    const j = await discoveryFetch("/api/operator/app-config", {
+      method: "POST",
+      body: JSON.stringify(parsed),
+    });
+    if (box) box.value = prettyJson(j?.config || {});
+    renderRestartStatus(j?.restart || null);
+    if (status) status.textContent = String(j?.note || "Saved.");
+    return j;
+  } catch (e) {
+    if (status) status.textContent = `Save failed: ${String(e?.body?.error || e?.message || e)}`;
+    throw e;
+  }
+}
+
+function wireDiscoveryTabOnce() {
+  if (__discWired) return;
+  __discWired = true;
+
+  const refreshStatusBtn = document.getElementById("discRefreshStatusBtn");
+  const refreshAllBtn = document.getElementById("discRefreshAllBtn");
+  const loadCfgBtn = document.getElementById("discLoadConfigBtn");
+  const saveCfgBtn = document.getElementById("discSaveConfigBtn");
+  const loadEnvBtn = document.getElementById("discLoadEnvBtn");
+  const saveEnvBtn = document.getElementById("discSaveEnvBtn");
+  const loadAppBtn = document.getElementById("discLoadAppConfigBtn");
+  const saveAppBtn = document.getElementById("discSaveAppConfigBtn");
+
+  if (refreshStatusBtn) refreshStatusBtn.onclick = () => { discRefreshStatus().catch(() => {}); };
+  if (refreshAllBtn) refreshAllBtn.onclick = () => {
+    Promise.allSettled([
+      discRefreshStatus(),
+      discLoadRestartStatus(),
+      discLoadDiscoveryConfig(),
+      discLoadEnvConfig(),
+      discLoadAppConfig(),
+    ]).catch(() => {});
+  };
+  if (loadCfgBtn) loadCfgBtn.onclick = () => { discLoadDiscoveryConfig().catch(() => {}); };
+  if (saveCfgBtn) saveCfgBtn.onclick = () => { discSaveDiscoveryConfig().catch(() => {}); };
+  if (loadEnvBtn) loadEnvBtn.onclick = () => { discLoadEnvConfig().catch(() => {}); };
+  if (saveEnvBtn) saveEnvBtn.onclick = () => { discSaveEnvConfig().catch(() => {}); };
+  if (loadAppBtn) loadAppBtn.onclick = () => { discLoadAppConfig().catch(() => {}); };
+  if (saveAppBtn) saveAppBtn.onclick = () => { discSaveAppConfig().catch(() => {}); };
+}
+
+window.addEventListener("discovery:refresh", () => {
+  if (!__discWired) wireDiscoveryTabOnce();
+  Promise.allSettled([discRefreshStatus(), discLoadRestartStatus(), discLoadDiscoveryConfig(), discLoadEnvConfig(), discLoadAppConfig()]).catch(() => {});
+});
 
 async function netRefreshStatus() {
   const out = document.getElementById("netOut");
@@ -3288,17 +3498,20 @@ document.addEventListener("DOMContentLoaded", () => {
     const tabPolls = document.getElementById("tabPolls");
     const tabSettings = document.getElementById("tabSettings");
     const tabNetwork = document.getElementById("tabNetwork");
+    const tabDiscovery = document.getElementById("tabDiscovery");
 
     if (tabCreate) tabCreate.onclick = () => showTab("create");
     if (tabPolls) tabPolls.onclick = () => showTab("polls");
     if (tabSettings) tabSettings.onclick = () => showTab("settings");
     if (tabNetwork) tabNetwork.onclick = () => showTab("network");
+    if (tabDiscovery) tabDiscovery.onclick = () => showTab("discovery");
     
     // Default view on startup
     showTab(currentTab || "polls");
 
     // Wire network tab buttons (deferred from outer scope so DOM exists)
     wireNetworkTabOnce();
+    wireDiscoveryTabOnce();
 
     if (backToListBtn) {
       backToListBtn.onclick = () => {

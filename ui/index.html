@@ -42,6 +42,7 @@
             <button id="tabPolls" class="pill" type="button" data-tab="polls" style="width:auto;">Polls</button>
             <button id="tabSettings" class="pill" type="button" data-tab="settings" style="width:auto;">Settings</button>
             <button id="tabNetwork" class="pill" type="button" data-tab="network" style="width:auto; display:none;">Network</button>
+            <button id="tabDiscovery" class="pill" type="button" data-tab="discovery" style="width:auto; display:none;">Discovery</button>
           </div>
         </div>
 
@@ -374,6 +375,75 @@
             </div>
           </div>
 
+        </div>
+      </section>
+
+      <!-- ========================= -->
+      <!-- PAGE: DISCOVERY (ADMIN)   -->
+      <!-- ========================= -->
+      <section id="viewDiscovery" style="display:none; max-width:900px; margin:0 auto;">
+        <div class="card">
+          <h2 style="margin:0;">Discovery Admin</h2>
+          <div class="muted2" style="font-size:12px; margin-top:6px;">
+            Operator-only discovery queue visibility and configuration.
+          </div>
+
+          <div class="row" style="gap:10px; flex-wrap:wrap; margin-top:12px;">
+            <button id="discRefreshStatusBtn" type="button" class="btn-ghost">Refresh Discovery Status</button>
+            <button id="discRefreshAllBtn" type="button" class="btn-ghost">Refresh All Config</button>
+            <span id="discOut" class="muted"></span>
+          </div>
+
+          <div class="grid" style="margin-top:10px;">
+            <div class="card" style="padding:10px;">
+              <h3 style="margin:0 0 8px 0;">Restart Status</h3>
+              <div id="discRestartState" class="muted">Unknown.</div>
+              <div id="discRestartReasons" class="muted2" style="font-size:12px; margin-top:6px;"></div>
+            </div>
+            <div class="card" style="padding:10px;">
+              <h3 style="margin:0 0 8px 0;">Queue Status Snapshot</h3>
+              <pre id="discStatusJson" style="max-height:260px; overflow:auto;">{}</pre>
+            </div>
+          </div>
+
+          <hr />
+
+          <h3 style="margin-top:6px;">Discovery Configuration</h3>
+          <div class="muted2" style="font-size:12px; margin-bottom:8px;">
+            Edits `data/discovery.config.json`. Controls brackets and gatekeeper behavior.
+          </div>
+          <textarea id="discConfigJson" rows="12" style="width:100%; font-family:monospace;"></textarea>
+          <div class="row" style="gap:10px; flex-wrap:wrap; margin-top:8px;">
+            <button id="discLoadConfigBtn" type="button" class="btn-ghost">Load</button>
+            <button id="discSaveConfigBtn" type="button">Save Discovery Config</button>
+            <span id="discConfigStatus" class="muted"></span>
+          </div>
+
+          <hr />
+
+          <h3 style="margin-top:6px;">Runtime Environment Overrides</h3>
+          <div class="muted2" style="font-size:12px; margin-bottom:8px;">
+            Edits `data/operator.env.overrides.json` and applies selected keys to live process env.
+          </div>
+          <textarea id="discEnvJson" rows="12" style="width:100%; font-family:monospace;"></textarea>
+          <div class="row" style="gap:10px; flex-wrap:wrap; margin-top:8px;">
+            <button id="discLoadEnvBtn" type="button" class="btn-ghost">Load</button>
+            <button id="discSaveEnvBtn" type="button">Save Env Overrides</button>
+            <span id="discEnvStatus" class="muted"></span>
+          </div>
+
+          <hr />
+
+          <h3 style="margin-top:6px;">Main App Config (`config.js`)</h3>
+          <div class="muted2" style="font-size:12px; margin-bottom:8px;">
+            Writes `config.js`. Some startup-bound values require restart to fully apply.
+          </div>
+          <textarea id="discAppConfigJson" rows="12" style="width:100%; font-family:monospace;"></textarea>
+          <div class="row" style="gap:10px; flex-wrap:wrap; margin-top:8px;">
+            <button id="discLoadAppConfigBtn" type="button" class="btn-ghost">Load</button>
+            <button id="discSaveAppConfigBtn" type="button">Save App Config</button>
+            <span id="discAppConfigStatus" class="muted"></span>
+          </div>
         </div>
       </section>
 
